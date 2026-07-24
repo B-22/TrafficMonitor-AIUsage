@@ -1,0 +1,9 @@
+build*/
+.history/
+docs/
+.trae/
+_recycle_bin/
+
+docs/reference/quota_card.py
+docs/reference/*.dc.html
+docs/reference/*.py
