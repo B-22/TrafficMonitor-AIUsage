@@ -3,6 +3,7 @@ build*/
 docs/
 .trae/
 _recycle_bin/
+deploy-local.ps1
 
 docs/reference/quota_card.py
 docs/reference/*.dc.html
