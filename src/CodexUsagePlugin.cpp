@@ -327,12 +327,12 @@ public:
     int GetItemWidthEx(void* hDC) const override {
         // After first draw, return actual measured width
         if (cachedW_ > 0) return cachedW_;
-        // Initial estimate before first draw
-        if (!hDC) return 300;
+        // Minimal initial estimate — will be corrected after first draw
+        if (!hDC) return 200;
         HDC hdc = (HDC)hDC;
         int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
         if (dpi < 72) dpi = 96;
-        return 300 * dpi / 96;
+        return 200 * dpi / 96;
     }
 
     void DrawItem(void* hDC, int x, int y, int w, int h, bool dark) override {
