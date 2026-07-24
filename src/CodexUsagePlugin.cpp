@@ -586,6 +586,7 @@ public:
     void SetSnapshot(const DashData& d) { std::lock_guard<std::mutex> lk(mu_); data_ = d; }
     void SetOptions(const PluginOptions& o) { std::lock_guard<std::mutex> lk(mu_); opts_ = o; }
     const PluginOptions& GetOptions() const { std::lock_guard<std::mutex> lk(mu_); return opts_; }
+    DashData GetSnapshot() const { std::lock_guard<std::mutex> lk(mu_); return data_; }
 
 private:
     mutable std::mutex mu_;
@@ -661,33 +662,118 @@ public:
     OptionReturn ShowOptionsDialog(void* hParent) override {
         HWND parent = (HWND)hParent;
         PluginOptions o = dash_.GetOptions();
+        DashData snap = dash_.GetSnapshot();
 
-        // Simple dialog using MessageBox-style approach
-        // Build message showing current settings
-        wchar_t msg[1024];
+        // Run connectivity test
+        auto conn = TestConnectivity();
+
+        // Read proxy settings from config
+        std::wstring proxyServer;
+        bool requireProxy = false;
+        std::wstring iniActualPath;
+        if (!configDir_.empty()) {
+            std::wstring iniPath = configDir_ + L"\\AIUsage.ini";
+            iniActualPath = iniPath;
+            wchar_t buf[256];
+            GetPrivateProfileStringW(L"AIUsage", L"ProxyServer", L"", buf, 256, iniPath.c_str());
+            proxyServer = buf;
+            GetPrivateProfileStringW(L"AIUsage", L"RequireProxy", L"0", buf, 256, iniPath.c_str());
+            requireProxy = (buf[0] == L'1');
+        }
+
+        // Build proxy status string
+        std::wstring proxyStatus;
+        if (!proxyServer.empty()) {
+            proxyStatus = L"Explicit: " + proxyServer;
+        } else if (proxyConfig_.systemProxyDetected) {
+            proxyStatus = L"System proxy detected";
+        } else {
+            proxyStatus = L"None";
+        }
+
+        // Connectivity status
+        std::wstring connStatus;
+        if (conn.directReachable && conn.proxyReachable) {
+            connStatus = L"Direct + Proxy OK";
+        } else if (conn.directReachable) {
+            connStatus = L"Direct OK (no proxy needed)";
+        } else if (conn.proxyReachable) {
+            connStatus = L"Proxy only (direct blocked)";
+        } else {
+            connStatus = L"FAILED - check network";
+        }
+
+        // Build data diagnostic strings
+        wchar_t c7ResetBuf[64] = L"(empty)";
+        if (!snap.c7Reset.empty()) {
+            std::wstring tmp(snap.c7Reset.begin(), snap.c7Reset.end());
+            swprintf_s(c7ResetBuf, L"%s", tmp.c_str());
+        }
+        wchar_t x7ResetBuf[64];
+        swprintf_s(x7ResetBuf, L"%lld", snap.x7ResetUnix);
+
+        wchar_t msg[3072];
         swprintf_s(msg,
-            L"AI Usage Plugin Options\n\n"
-            L"Current settings:\n"
-            L"1. Show %% sign: %s\n"
-            L"2. Show Credits: %s\n"
-            L"3. Show 5h Reset: %s\n"
-            L"4. Show Subscription: %s\n"
-            L"5. Show Status: %s\n\n"
-            L"To change settings, edit config.ini:\n"
-            L"[AIUsage]\n"
-            L"ShowPctSign=0\n"
-            L"ShowCredits=1\n"
-            L"ShowReset=1\n"
-            L"ShowSubscription=1\n"
-            L"ShowStatus=1\n"
-            L"CustomSubExpiry=2026-12-20\n"
-            L"ProxyServer=\n"
-            L"RequireProxy=0",
+            L"AI Usage Plugin Options\n"
+            L"========================================\n\n"
+            L"Display Options:\n"
+            L"  1. Show %% sign:          %s\n"
+            L"  2. Show Credits:          %s\n"
+            L"  3. Show 5h Reset:         %s\n"
+            L"  4. Show Subscription:     %s\n"
+            L"  5. Show Status:           %s\n"
+            L"  6. Show Claude 7d Reset:  %s\n"
+            L"  7. Show Codex 7d Reset:   %s\n"
+            L"  8. Show 7d Countdown:     %s\n"
+            L"  9. Custom Sub Expiry:     %s\n\n"
+            L"Proxy Settings:\n"
+            L"  Proxy Server:   %s\n"
+            L"  Require Proxy:  %s\n\n"
+            L"Connectivity Test:\n"
+            L"  Direct:  %s\n"
+            L"  Proxy:   %s\n"
+            L"  Status:  %s\n\n"
+            L"Data Diagnostics:\n"
+            L"  Config Path:    %s\n"
+            L"  Claude 5h%%:    %d\n"
+            L"  Claude 7d%%:    %d\n"
+            L"  Claude 7d Reset: %s\n"
+            L"  Codex 7d%%:     %d\n"
+            L"  Codex 7d Reset:  %s\n"
+            L"  Data OK:         %s\n\n"
+            L"To change settings, edit AIUsage.ini:\n"
+            L"  [AIUsage]\n"
+            L"  ShowPctSign=0\n"
+            L"  ShowCredits=1\n"
+            L"  ShowReset=1\n"
+            L"  ShowSubscription=1\n"
+            L"  ShowStatus=1\n"
+            L"  ShowClaude7dReset=1\n"
+            L"  ShowCodex7dReset=1\n"
+            L"  Show7dCountdown=1\n"
+            L"  CustomSubExpiry=2026-12-20\n"
+            L"  ProxyServer=127.0.0.1:7890\n"
+            L"  RequireProxy=0",
             o.showPctSign ? L"Yes" : L"No",
             o.showCredits ? L"Yes" : L"No",
             o.showReset ? L"Yes" : L"No",
             o.showSubscription ? L"Yes" : L"No",
-            o.showStatus ? L"Yes" : L"No");
+            o.showStatus ? L"Yes" : L"No",
+            o.showClaude7dReset ? L"Yes" : L"No",
+            o.showCodex7dReset ? L"Yes" : L"No",
+            o.show7dCountdown ? L"Yes" : L"No",
+            o.customSubExpiry.empty() ? L"(auto)" : std::wstring(o.customSubExpiry.begin(), o.customSubExpiry.end()).c_str(),
+            proxyServer.empty() ? L"(system)" : proxyServer.c_str(),
+            requireProxy ? L"Yes" : L"No",
+            conn.directReachable ? L"Yes" : L"No",
+            conn.proxyReachable ? L"Yes" : L"No",
+            connStatus.c_str(),
+            iniActualPath.empty() ? L"(not set)" : iniActualPath.c_str(),
+            snap.c5, snap.c7,
+            c7ResetBuf,
+            snap.x7,
+            x7ResetBuf,
+            snap.stale ? L"Stale" : L"OK");
         MessageBoxW(parent, msg, L"AI Usage Options", MB_OK | MB_ICONINFORMATION);
         return OR_OPTION_UNCHANGED;
     }
@@ -757,11 +843,15 @@ private:
     std::wstring BuildTip(const ClaudeUsageData& c, const UsageSnapshot& x) const {
         std::wstring t;
 
-        // Proxy status (informational)
-        if (proxyConfig_.proxyActive && !proxyConfig_.statusMessage.empty()) {
+        // Proxy status (always show for user awareness)
+        if (!proxyConfig_.statusMessage.empty()) {
             t += L"Proxy: ";
             t += proxyConfig_.statusMessage;
             t += L"\n";
+        } else if (proxyConfig_.systemProxyDetected) {
+            t += L"Proxy: System proxy detected\n";
+        } else {
+            t += L"Proxy: None (direct/auto)\n";
         }
 
         auto addReset = [&](const std::string& iso) -> std::wstring {

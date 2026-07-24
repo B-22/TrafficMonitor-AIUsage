@@ -15,3 +15,15 @@ ProxyConfig DetectProxy(const std::wstring& explicitProxy, bool requireProxy);
 
 // Create HTTP session with appropriate proxy settings
 HINTERNET OpenHttpSession(const ProxyConfig& config, const wchar_t* userAgent);
+
+// Connectivity test result
+struct ConnectivityResult {
+    bool directReachable = false;      // can reach api.anthropic.com directly (no proxy)
+    bool proxyReachable = false;       // can reach via system proxy
+    DWORD directError = 0;             // WinHTTP error code for direct attempt
+    std::wstring statusMessage;        // human-readable summary
+};
+
+// Test connectivity to Claude/Codex API endpoints
+// Helps users with VPN/TUN determine if they need a proxy
+ConnectivityResult TestConnectivity();
