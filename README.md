@@ -4,34 +4,102 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 
 ![Preview](docs/design/preview_final.png)
 
-## 功能一览
+## 功能完整列表
 
-| 显示项 | 数据来源 | 说明 |
-|--------|----------|------|
-| Claude 5h | `/api/oauth/usage` | 5 小时滑动窗口已用百分比 |
-| Claude 7d | `/api/oauth/usage` | 7 天窗口已用百分比 |
-| Codex 7d | `/backend-api/wham/usage` | 7 天窗口已用百分比 |
-| Credits | `/api/oauth/usage` extra_usage | Claude 超额用量金额 |
-| 5h 重置 | usage API resets_at | 下次 5h 窗口重置时间（本地时区） |
-| 订阅状态 | `/api/oauth/profile` | 红点=已取消，绿点=正常 |
+### 数据源
 
-## 显示样式
+| 数据 | 来源 | 说明 |
+|------|------|------|
+| Claude 5h 用量 | `/api/oauth/usage` | 5 小时滑动窗口已用百分比 |
+| Claude 7d 用量 | `/api/oauth/usage` | 7 天窗口已用百分比 |
+| Claude Credits | `/api/oauth/usage` `extra_usage` | 超额用量金额（$） |
+| Claude 5h 重置时间 | `/api/oauth/usage` `resets_at` | 下次 5h 窗口重置的本地时间 |
+| Claude 7d 重置时间 | `/api/oauth/usage` `resets_at` | 下次 7d 窗口重置日期 |
+| Claude 订阅状态 | `/api/oauth/profile` | active/canceled/past_due 等 |
+| Codex 5h 用量 | `/backend-api/wham/usage` | 5 小时窗口已用百分比 |
+| Codex 7d 用量 | `/backend-api/wham/usage` | 7 天窗口已用百分比 |
+| Codex 7d 重置时间 | `/backend-api/wham/usage` `reset_at` | 下次 7d 窗口重置时间 |
 
-基于 Windows 10 任务栏自绘（GDI + GDI+ 抗锯齿圆环），透明背景融合任务栏：
+### 显示项（均可独立开关）
 
-```
-[55] [18] [4]  │  Credits  $34.20  │  5h重置  14:32  │  ●12月20日
- Claude环 Codex环    分隔线    信息块         信息块        红点+日期
-```
+| 显示项 | 配置键 | 默认 | 说明 |
+|--------|--------|------|------|
+| Claude 5h 圆环 | 自动 | 始终显示 | 橙色环，百分比数字 |
+| Claude 7d 圆环 | 自动 | 始终显示 | 橙色环，百分比数字 |
+| Codex 7d 圆环 | 自动 | 始终显示 | 青色环，百分比数字 |
+| 百分比号 | `ShowPctSign` | 隐藏 | 0=只显示数字, 1=显示% |
+| Credits 金额 | `ShowCredits` | 显示 | Claude 超额用量金额 |
+| 5h 重置时间 | `ShowReset` | 显示 | 下次 5h 窗口重置时间 |
+| 订阅到期 | `ShowSubscription` | 显示 | 日期 + 红/绿点状态 |
+| Claude 7d 重置星期 | `ShowClaude7dReset` | 隐藏 | 显示周一~周日 |
+| Codex 7d 重置星期 | `ShowCodex7dReset` | 隐藏 | 显示周一~周日 |
+| 7d 重置倒计时 | `Show7dCountdown` | 隐藏 | 穿透显示，>24h 显示周几+时间，<24h 显示倒计时，<2h 红色 |
+| 过期提示 | `ShowStatus` | 显示 | 数据 >15min 未更新时红色提示 |
+| 自定义订阅日期 | `CustomSubExpiry` | 空 | 手动设置订阅到期日，格式 2026-12-20 |
 
-- 圆环 24px，线宽 2.5px，进度从顶部顺时针
-- Claude 橙色 `#c66c32`，Codex 青色 `#2ea8b1`
-- 进度颜色：0-59% 原色 → 60-84% 橙色 → 85-100% 红色
-- 默认隐藏百分比号，只显示数字
+### 圆环颜色逻辑
 
-## 插件选项
+| 百分比 | 颜色 |
+|--------|------|
+| 0-59% | Claude 橙色 `#c66c32` / Codex 青色 `#2ea8b1` |
+| 60-84% | 警告橙色 |
+| 85-100% | 红色 |
+| 无数据 | 灰色 |
 
-编辑 `AIUsage.ini`（TrafficMonitor 配置目录下），所有选项均有中文注释：
+### 订阅状态指示
+
+- 红点：已取消 (canceled)、逾期 (past_due)、暂停 (paused)
+- 绿点：正常 (active)、试用中 (trialing)
+
+### 过期状态
+
+- 数据超过 15 分钟未更新时自动显示
+- 显示格式：`过期 18m` 或 `过期 2h16m`
+- 红色文字
+- 保留最后一次成功数据，不清零
+- Tooltip 显示最后成功更新时间和最近错误
+
+### 7d 重置倒计时
+
+- 自动选择最近的 7d 重置时间（Claude 或 Codex）
+- >24h：显示 `周三 14:32` 格式
+- <24h：显示 `5h30m` 倒计时格式
+- <2h：红色文字警告
+
+### 凭据读取
+
+**Claude**（优先级从高到低）：
+1. MSIX Claude Desktop `%LOCALAPPDATA%\Packages\Claude_*\...\config.json`（DPAPI + AES-GCM 解密）
+2. 经典安装 `%APPDATA%\Claude\config.json`
+3. CLI `%USERPROFILE%\.claude\.credentials.json`（支持 token 刷新和写回）
+
+只读桌面版令牌，不影响桌面版登录态。
+
+**Codex**：
+- `~/.codex/auth.json`（支持 token 刷新和写回）
+
+### 数据刷新逻辑
+
+- 后台线程每 60 秒刷新
+- UI 线程只读缓存，不阻塞任务栏
+- Claude/Codex 独立请求，互不影响
+- 429 限流指数退避（120s → 900s）
+- 失败保留最后一次成功数据
+- Profile API 仅首次请求一次（获取订阅状态）
+
+### 代理配置
+
+- `ProxyServer`：显式指定代理地址（如 `http://127.0.0.1:7890`）
+- 留空使用系统网络栈（支持 TUN/VPN）
+- WinHTTP `AUTOMATIC_PROXY` 模式自动通过系统网络适配器路由
+
+### 安全
+
+- 日志不记录 token、Authorization、Cookie 等敏感信息
+- 不修改或删除 Claude/Codex 官方凭据文件
+- Token 刷新沿用参考项目的安全写入方式
+
+## 插件选项（AIUsage.ini）
 
 ```ini
 [AIUsage]
@@ -39,48 +107,14 @@ ShowPctSign=0          # 圆环内是否显示 %
 ShowCredits=1          # 显示 Credits 金额
 ShowReset=1            # 显示 5h 重置时间
 ShowSubscription=1     # 显示订阅状态和日期
-ShowStatus=1           # 数据过期时显示红色提示
-CustomSubExpiry=       # 自定义订阅到期日, 如 2026-12-20
-ProxyServer=           # 代理地址, 如 http://127.0.0.1:7890
-RequireProxy=1         # 1=无代理时阻止请求(默认), 0=允许直连
+ShowStatus=1           # 过期时显示红色提示
+ShowClaude7dReset=0    # Claude 7d 重置星期
+ShowCodex7dReset=0     # Codex 7d 重置星期
+Show7dCountdown=0      # 7d 重置倒计时穿透显示
+CustomSubExpiry=       # 自定义订阅到期日
+ProxyServer=           # 代理地址
+RequireProxy=0         # 0=不阻止(默认), 1=无代理时阻止
 ```
-
-## 代理安全
-
-插件默认要求代理才能发起 API 请求，防止真实 IP + 凭证直接暴露给 Claude/Codex 服务器。
-
-- 启动时自动检测系统代理配置（IE 代理、系统代理、PAC 脚本）
-- 支持在 `AIUsage.ini` 中显式指定代理地址
-- 无代理时任务栏显示"代理未配置"红色警告，所有数据项显示 `--`
-- 设置 `RequireProxy=0` 可关闭此保护（不推荐）
-
-## 凭据来源
-
-### Claude（优先级从高到低）
-1. **MSIX Claude Desktop** — `%LOCALAPPDATA%\Packages\Claude_*\...\config.json`（DPAPI + AES-GCM 解密）
-2. **经典安装** — `%APPDATA%\Claude\config.json`
-3. **CLI** — `%USERPROFILE%\.claude\.credentials.json`（支持 token 刷新和写回）
-
-只读桌面版令牌，不影响桌面版登录态。
-
-### Codex
-- `~/.codex/auth.json`（支持 token 刷新和写回）
-
-## 数据刷新
-
-- 后台线程每 60 秒刷新，UI 线程只读缓存
-- Claude/Codex 独立请求，互不影响
-- 429 限流指数退避（120s ~ 900s）
-- 失败保留最后一次成功数据
-- 超过 15 分钟未更新标记为过期
-- Profile API 仅首次请求一次（获取订阅状态）
-
-## 安全
-
-- 日志不记录 token、Authorization、Cookie 等敏感信息
-- 不修改或删除 Claude/Codex 官方凭据文件
-- 默认要求代理，防止真实 IP 暴露
-- Token 刷新沿用参考项目的安全写入方式
 
 ## 构建
 
@@ -96,50 +130,45 @@ ctest --test-dir build -C Release --output-on-failure
 
 ### 部署
 
-1. 复制 `AIUsagePreview.dll` 到 `TrafficMonitor/plugins/`
-2. 复制 `AIUsage.ini` 到 TrafficMonitor 配置目录
-3. 重启 TrafficMonitor
-4. 在显示设置中启用 "AI Usage Dashboard"
+1. 关闭 TrafficMonitor
+2. 复制 `AIUsagePreview.dll` 到 `TrafficMonitor/plugins/`
+3. 复制 `AIUsage.ini` 到 TrafficMonitor 配置目录
+4. 启动 TrafficMonitor
+5. 在显示设置中启用 "AI Usage Dashboard"
 
 ## 文件结构
 
 ```
 ├── CMakeLists.txt
-├── AIUsage.ini                    # 插件配置模板
+├── AIUsage.ini                    # 配置模板
 ├── LICENSE
 ├── README.md
+├── gemini_bridge.user.js          # Gemini 用量监控脚本
 ├── include/
-│   └── PluginInterface.h          # TrafficMonitor 插件接口
+│   └── PluginInterface.h
 ├── src/
 │   ├── CodexUsagePlugin.cpp       # 主插件 + GDI 自绘
-│   ├── CodexUsageFetcher.cpp/h    # Codex 令牌读取 + API 请求
-│   ├── CodexUsageCore.cpp/h       # Codex JSON 解析 + tooltip
-│   ├── ClaudeUsageFetcher.cpp/h   # Claude API + profile 请求
-│   ├── ClaudeCredentialReader.cpp/h  # Claude 凭据读取（DPAPI）
-│   ├── DpapiHelper.cpp/h          # Windows DPAPI + AES-GCM 解密
-│   ├── ProxyHelper.cpp/h          # 代理检测和会话创建
-│   ├── JsonLite.cpp/h             # 轻量 JSON 解析器
-│   └── CodexUsageVersion.h.in     # 版本模板
+│   ├── CodexUsageFetcher.cpp/h    # Codex 令牌 + API
+│   ├── CodexUsageCore.cpp/h       # Codex JSON 解析
+│   ├── ClaudeUsageFetcher.cpp/h   # Claude API + profile
+│   ├── ClaudeCredentialReader.cpp/h  # Claude 凭据读取
+│   ├── DpapiHelper.cpp/h          # DPAPI + AES-GCM
+│   ├── ProxyHelper.cpp/h          # 代理检测
+│   ├── JsonLite.cpp/h             # JSON 解析器
+│   └── CodexUsageVersion.h.in
 ├── tests/
-│   └── CodexUsageCoreTests.cpp    # 单元测试
+│   └── CodexUsageCoreTests.cpp
 └── docs/
-    ├── README.md                  # 详细文档
-    └── design/
-        ├── taskbar_preview.html   # HTML 设计稿
-        └── preview_*.png          # 设计截图
+    ├── CONTRIBUTING.md            # 协作规范
+    └── design/                    # 设计稿
 ```
 
 ## 致谢
 
-本项目在以下开源项目基础上开发，感谢原作者的贡献：
-
-- **[HCLonely/TrafficMonitor_Codex_Plugin](https://github.com/HCLonely/TrafficMonitor_Codex_Plugin)** — 本项目的核心基础。提供了 TrafficMonitor 插件框架、CMake 工程结构、Codex 用量获取逻辑、WinHTTP 封装、JSON 解析器、后台刷新机制和单元测试。本项目的 Codex 功能完全沿用其代码。
-
-- **[huanchong-99/claude-usage-assistant](https://github.com/huanchong-99/claude-usage-assistant)** — Claude 用量获取的参考实现。本项目的 Claude 凭据读取（DPAPI 解密、Chromium Local State 密钥、MSIX/Desktop/CLI 多来源）、OAuth token 刷新、usage API 请求、429 退避策略等核心逻辑均参考并移植自该项目的 `quota_card.py`。
-
-- **[bemaru/trafficmonitor-ai-usage-plugin](https://github.com/bemaru/trafficmonitor-ai-usage-plugin)** — 提供了 `PluginInterface.h` 头文件和 TrafficMonitor 插件开发参考。
-
-- **[zhongyang219/TrafficMonitor](https://github.com/zhongyang219/TrafficMonitor)** — TrafficMonitor 本体，提供了插件接口和任务栏嵌入框架。
+- **[HCLonely/TrafficMonitor_Codex_Plugin](https://github.com/HCLonely/TrafficMonitor_Codex_Plugin)** — 核心基础，提供插件框架、Codex 逻辑、WinHTTP 封装、JSON 解析器
+- **[huanchong-99/claude-usage-assistant](https://github.com/huanchong-99/claude-usage-assistant)** — Claude 凭据读取、DPAPI 解密、OAuth 刷新、usage API 参考
+- **[bemaru/trafficmonitor-ai-usage-plugin](https://github.com/bemaru/trafficmonitor-ai-usage-plugin)** — PluginInterface.h
+- **[zhongyang219/TrafficMonitor](https://github.com/zhongyang219/TrafficMonitor)** — 插件接口和任务栏嵌入框架
 
 ## 许可证
 

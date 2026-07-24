@@ -169,6 +169,78 @@ std::wstring IsoToWeekday(const std::string& iso) {
     return L"--";
 }
 
+// Format 7d reset countdown: "周三 14:32" or "5h30m" or "23m"
+// Returns {text, isUrgent} where isUrgent = true if < 2h
+std::pair<std::wstring, bool> Format7dCountdown(const std::string& iso, long long unixSec) {
+    double now = (double)time(nullptr);
+    double resetAt = 0;
+
+    if (!iso.empty()) {
+        SYSTEMTIME utc{};
+        int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
+            &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
+        if (n >= 3) {
+            SYSTEMTIME local{};
+            SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+            FILETIME ft{};
+            SystemTimeToFileTime(&local, &ft);
+            ULARGE_INTEGER uli;
+            uli.LowPart = ft.dwLowDateTime;
+            uli.HighPart = ft.dwHighDateTime;
+            resetAt = (double)(uli.QuadPart - 116444736000000000ULL) / 10000000.0;
+        }
+    } else if (unixSec > 0) {
+        resetAt = (double)unixSec;
+    }
+
+    if (resetAt <= now) return { L"--", false };
+    double diff = resetAt - now;
+
+    // If > 24h, show weekday + time
+    if (diff > 86400) {
+        // Parse the time to get weekday and HH:MM
+        if (!iso.empty()) {
+            SYSTEMTIME utc{};
+            int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
+                &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
+            if (n >= 5) {
+                SYSTEMTIME local{};
+                SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+                static const wchar_t* wd[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
+                    L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
+                wchar_t buf[32];
+                swprintf_s(buf, L"%s %02d:%02d", wd[local.wDayOfWeek], local.wHour, local.wMinute);
+                return { buf, false };
+            }
+        }
+        if (unixSec > 0) {
+            FILETIME ft{};
+            ULARGE_INTEGER uli;
+            uli.QuadPart = (ULONGLONG)((double)unixSec * 1e7 + 116444736000000000ULL);
+            ft.dwLowDateTime = uli.LowPart; ft.dwHighDateTime = uli.HighPart;
+            SYSTEMTIME utc{}, local{};
+            FileTimeToSystemTime(&ft, &utc);
+            SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+            static const wchar_t* wd[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
+                L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
+            wchar_t buf[32];
+            swprintf_s(buf, L"%s %02d:%02d", wd[local.wDayOfWeek], local.wHour, local.wMinute);
+            return { buf, false };
+        }
+        return { L"--", false };
+    }
+
+    // < 24h: show countdown
+    int h = (int)(diff / 3600);
+    int m = ((int)diff % 3600) / 60;
+    wchar_t buf[32];
+    if (h > 0)
+        swprintf_s(buf, L"%dh%02dm", h, m);
+    else
+        swprintf_s(buf, L"%dm", m);
+    return { buf, diff < 7200 }; // urgent if < 2h
+}
+
 // Unix timestamp -> weekday in Chinese
 std::wstring UnixToWeekday(long long unixSec) {
     if (unixSec <= 0) return L"--";
@@ -290,6 +362,7 @@ struct PluginOptions {
     bool showStatus = true;
     bool showClaude7dReset = false; // show Claude 7d reset weekday
     bool showCodex7dReset = false;  // show Codex 7d reset weekday
+    bool show7dCountdown = false;    // 7d reset countdown (穿透显示)
     std::string customSubExpiry;    // user-set date, e.g. "2026-12-20"
 };
 
@@ -477,6 +550,25 @@ public:
             block(L"Codex\u91CD\u7F6E", wd.c_str());
         }
 
+        // ── 7d reset countdown (穿透显示) ──
+        if (opts.show7dCountdown) {
+            // Use Claude 7d reset if available, otherwise Codex
+            auto [countdown, urgent] = Format7dCountdown(snap.c7Reset, snap.x7ResetUnix);
+            if (countdown != L"--") {
+                Gdiplus::Color valColor = urgent
+                    ? Gdiplus::Color(STALE_CLR)  // red when < 2h
+                    : cValue;
+                int by = cy - h / 2 + m.infoPadTop;
+                DrawTextAt(g, L"7d\u91CD\u7F6E", (float)curX, (float)by, ff,
+                           (float)m.infoLabelSize, cLabel, false);
+                DrawTextAt(g, countdown.c_str(), (float)curX, (float)(by + m.infoLabelSize + 3),
+                           ff, (float)m.infoValueSize, valColor, true);
+                int bw = std::max(TextWidth(g, countdown.c_str(), ff, (float)m.infoValueSize, true),
+                                  TextWidth(g, L"7d\u91CD\u7F6E", ff, (float)m.infoLabelSize, false));
+                curX += bw + m.infoGap;
+            }
+        }
+
         // ── Separator 2 + status (only show when stale) ──
         if (opts.showStatus && snap.stale && snap.staleAge > 0) {
             curX += m.sepMargin;
@@ -636,6 +728,9 @@ private:
 
         GetPrivateProfileStringW(L"AIUsage", L"ShowCodex7dReset", L"0", buf, 256, iniPath.c_str());
         o.showCodex7dReset = (buf[0] == L'1');
+
+        GetPrivateProfileStringW(L"AIUsage", L"Show7dCountdown", L"0", buf, 256, iniPath.c_str());
+        o.show7dCountdown = (buf[0] == L'1');
 
         GetPrivateProfileStringW(L"AIUsage", L"CustomSubExpiry", L"", buf, 256, iniPath.c_str());
         // Convert wide to narrow
