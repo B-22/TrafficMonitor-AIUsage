@@ -34,17 +34,45 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Resolve version
         id: version
         shell: pwsh
         run: |
-          $version = "0.1.0"
+          # 如果是标签推送，使用标签中的版本号
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -like "v*") {
             $version = $env:GITHUB_REF_NAME.Substring(1)
+            Write-Host "Using tag version: $version"
+          }
+          # 如果是 main 分支推送，自动增长版本号
+          elseif ($env:GITHUB_REF_NAME -eq "main") {
+            # 获取最新标签
+            $latestTag = git tag --list 'v*' --sort=-v:refname | Select-Object -First 1
+            if ($latestTag) {
+              # 移除 'v' 前缀并解析版本号
+              $versionStr = $latestTag.Substring(1)
+              $parts = $versionStr -split '\.'
+              if ($parts.Count -ge 3) {
+                # 自动增长补丁版本号
+                $major = [int]$parts[0]
+                $minor = [int]$parts[1]
+                $patch = [int]$parts[2] + 1
+                $version = "$major.$minor.$patch"
+              } else {
+                $version = "0.1.0"
+              }
+            } else {
+              $version = "0.1.0"
+            }
+            Write-Host "Auto-incremented version: $version"
+          }
+          else {
+            $version = "0.1.0"
+            Write-Host "Using default version: $version"
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "Resolved version: $version"
 
       - name: Configure
         run: >
@@ -83,11 +111,50 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: windows-latest
-    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    # 允许标签推送或 main 分支推送时执行
+    if: (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) || (github.ref_name == 'main')
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release-tag
+        shell: pwsh
+        run: |
+          # 如果是标签推送，使用现有标签
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tagName = $env:GITHUB_REF_NAME
+          }
+          # 如果是 main 分支推送，创建新标签
+          else {
+            # 获取最新标签
+            $latestTag = git tag --list 'v*' --sort=-v:refname | Select-Object -First 1
+            if ($latestTag) {
+              $versionStr = $latestTag.Substring(1)
+              $parts = $versionStr -split '\.'
+              if ($parts.Count -ge 3) {
+                $major = [int]$parts[0]
+                $minor = [int]$parts[1]
+                $patch = [int]$parts[2] + 1
+                $tagName = "v$major.$minor.$patch"
+              } else {
+                $tagName = "v0.1.0"
+              }
+            } else {
+              $tagName = "v0.1.0"
+            }
+          }
+          Write-Host "Release tag: $tagName"
+          "tag=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create tag (for main branch)
+        if: github.ref_name == 'main'
+        run: |
+          git tag ${{ steps.release-tag.outputs.tag }}
+          git push origin ${{ steps.release-tag.outputs.tag }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -100,10 +167,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME `
+          gh release create ${{ steps.release-tag.outputs.tag }} `
             release-assets\AIUsage-x86.zip `
             release-assets\AIUsage-x64.zip `
             release-assets\AIUsage-arm64.zip `
             --repo $env:GITHUB_REPOSITORY `
-            --title $env:GITHUB_REF_NAME `
+            --title ${{ steps.release-tag.outputs.tag }} `
             --generate-notes
