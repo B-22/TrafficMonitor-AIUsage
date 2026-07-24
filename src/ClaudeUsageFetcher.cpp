@@ -280,18 +280,6 @@ ClaudeUsageData ClaudeUsageFetcher::Fetch() {
 
     double now = static_cast<double>(time(nullptr));
 
-    // If proxy is required but not active, return cached data or error
-    if (proxyConfig_.requireProxy && !proxyConfig_.proxyActive) {
-        if (cachedData_.success) {
-            ClaudeUsageData stale = cachedData_;
-            stale.errorMessage = proxyConfig_.statusMessage;
-            return stale;
-        }
-        ClaudeUsageData err;
-        err.errorMessage = proxyConfig_.statusMessage.empty() ? L"Proxy not configured" : proxyConfig_.statusMessage;
-        return err;
-    }
-
     // Rate limiting: respect backoff
     if (now < backoffUntil_) {
         if (cachedData_.success) {

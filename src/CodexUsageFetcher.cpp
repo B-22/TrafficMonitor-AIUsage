@@ -158,12 +158,6 @@ std::optional<std::string> HttpGetJson(const ProxyConfig& proxyConfig,
 UsageSnapshot CodexUsageFetcher::Fetch() const {
     UsageSnapshot snapshot;
 
-    // If proxy is required but not active, return error
-    if (proxyConfig_.requireProxy && !proxyConfig_.proxyActive) {
-        snapshot.errorMessage = proxyConfig_.statusMessage.empty() ? L"Proxy not configured" : proxyConfig_.statusMessage;
-        return snapshot;
-    }
-
     std::wstring errorMessage;
     std::optional<std::string> accessToken = ReadAccessToken(&errorMessage);
     if (!accessToken.has_value()) {

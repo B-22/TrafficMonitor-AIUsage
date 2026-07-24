@@ -4,15 +4,14 @@
 #include <string>
 
 struct ProxyConfig {
-    bool requireProxy = true;
-    std::wstring explicitProxy;
-    bool systemProxyDetected = false;
-    bool proxyActive = false;
-    std::wstring statusMessage;
+    std::wstring explicitProxy;       // user-specified proxy from AIUsage.ini
+    bool systemProxyDetected = false; // whether system proxy was found (informational)
+    bool proxyActive = false;         // whether a proxy is configured
+    std::wstring statusMessage;       // status description for tooltip
 };
 
-// 检测代理配置
+// Detect proxy configuration (informational, never blocks requests)
 ProxyConfig DetectProxy(const std::wstring& explicitProxy, bool requireProxy);
 
-// 创建 HTTP 会话，自动应用代理配置
+// Create HTTP session with appropriate proxy settings
 HINTERNET OpenHttpSession(const ProxyConfig& config, const wchar_t* userAgent);

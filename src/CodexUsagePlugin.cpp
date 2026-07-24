@@ -307,9 +307,7 @@ struct DashData {
     long long usedCredits = 0;
     std::string currency;
     int decPlaces = 2;
-    std::string subStatus;   // "active", "canceled", etc.
-    bool proxyBlocked = false;
-    std::wstring proxyMessage;
+    std::string subStatus;
 };
 
 // =====================================================================
@@ -327,16 +325,13 @@ public:
     int GetItemWidth() const override { return cachedW_ > 0 ? cachedW_ : 360; }
 
     int GetItemWidthEx(void* hDC) const override {
-        if (!hDC) return cachedW_ > 0 ? cachedW_ : 280;
+        if (!hDC) return cachedW_ > 0 ? cachedW_ : 500;
         HDC hdc = (HDC)hDC;
         int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
         if (dpi < 72) dpi = 96;
-        LM m = GetMetrics(dpi);
-        // Conservative estimate: rings + separator + 3 info blocks (no status)
-        int w = m.padX + 3 * m.ringD + 2 * m.ringGap
-              + m.sepMargin + m.sepW + m.sepMargin
-              + 3 * (m.infoGap + 28 * dpi / 96) + m.padX;
-        cachedW_ = w;
+        // Return a generous estimate — DrawItem will update cachedW_ with actual width
+        int w = 500 * dpi / 96;
+        if (cachedW_ > w) w = cachedW_;
         return w;
     }
 
@@ -493,17 +488,6 @@ public:
             curX += TextWidth(g, st.c_str(), ff, (float)m.staleSize, true);
         }
 
-        // ── Proxy blocked indicator ──
-        if (snap.proxyBlocked) {
-            curX += m.sepMargin;
-            DrawLine(g, curX, cy - m.sepH / 2, cy + m.sepH / 2, SEP_COLOR);
-            curX += m.sepMargin;
-            const wchar_t* proxyTxt = L"\u4EE3\u7406\u672A\u914D\u7F6E";
-            DrawTextAt(g, proxyTxt, (float)curX, (float)(cy - m.staleSize / 2),
-                       ff, (float)m.staleSize, Gdiplus::Color(STALE_CLR), true);
-            curX += TextWidth(g, proxyTxt, ff, (float)m.staleSize, true);
-        }
-
         cachedW_ = curX + m.padX - x;
     }
 
@@ -558,8 +542,6 @@ public:
             double t = (double)time(nullptr);
             d.stale = (!claude.success && !codex.success) || (d.lastOk > 0 && t - d.lastOk > 900);
             if (d.lastOk > 0) d.staleAge = t - d.lastOk;
-            d.proxyBlocked = proxyConfig_.requireProxy && !proxyConfig_.proxyActive;
-            d.proxyMessage = proxyConfig_.statusMessage;
             dash_.SetSnapshot(d);
             std::lock_guard<std::mutex> lk(mu_);
             tip_ = BuildTip(claude, codex);
@@ -608,7 +590,7 @@ public:
             L"ShowStatus=1\n"
             L"CustomSubExpiry=2026-12-20\n"
             L"ProxyServer=\n"
-            L"RequireProxy=1",
+            L"RequireProxy=0",
             o.showPctSign ? L"Yes" : L"No",
             o.showCredits ? L"Yes" : L"No",
             o.showReset ? L"Yes" : L"No",
@@ -669,7 +651,7 @@ private:
         GetPrivateProfileStringW(L"AIUsage", L"ProxyServer", L"", buf, 256, iniPath.c_str());
         std::wstring proxyServer = buf;
 
-        GetPrivateProfileStringW(L"AIUsage", L"RequireProxy", L"1", buf, 256, iniPath.c_str());
+        GetPrivateProfileStringW(L"AIUsage", L"RequireProxy", L"0", buf, 256, iniPath.c_str());
         bool requireProxy = (buf[0] == L'1');
 
         proxyConfig_ = DetectProxy(proxyServer, requireProxy);
@@ -680,12 +662,8 @@ private:
     std::wstring BuildTip(const ClaudeUsageData& c, const UsageSnapshot& x) const {
         std::wstring t;
 
-        // Proxy status
-        if (proxyConfig_.requireProxy && !proxyConfig_.proxyActive) {
-            t += L"Proxy: ";
-            t += proxyConfig_.statusMessage.empty() ? L"Not configured" : proxyConfig_.statusMessage;
-            t += L"\n";
-        } else if (proxyConfig_.proxyActive && !proxyConfig_.statusMessage.empty()) {
+        // Proxy status (informational)
+        if (proxyConfig_.proxyActive && !proxyConfig_.statusMessage.empty()) {
             t += L"Proxy: ";
             t += proxyConfig_.statusMessage;
             t += L"\n";
