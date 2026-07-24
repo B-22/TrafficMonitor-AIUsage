@@ -152,6 +152,40 @@ std::wstring FormatStaleAge(double sec) {
     return b;
 }
 
+// ISO 8601 date -> weekday in Chinese (周一, 周二, ... 周日)
+std::wstring IsoToWeekday(const std::string& iso) {
+    if (iso.empty()) return L"--";
+    SYSTEMTIME utc{};
+    int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
+        &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
+    if (n < 3) return L"--";
+    SYSTEMTIME local{};
+    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+    // Day of week: 0=Sun, 1=Mon, ... 6=Sat
+    static const wchar_t* weekdays[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
+        L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
+    // Use SystemTime day of week if available, otherwise calculate
+    if (local.wDayOfWeek <= 6) return weekdays[local.wDayOfWeek];
+    return L"--";
+}
+
+// Unix timestamp -> weekday in Chinese
+std::wstring UnixToWeekday(long long unixSec) {
+    if (unixSec <= 0) return L"--";
+    FILETIME ft{};
+    ULARGE_INTEGER uli;
+    uli.QuadPart = static_cast<ULONGLONG>((double)unixSec * 10000000.0 + 116444736000000000ULL);
+    ft.dwLowDateTime = uli.LowPart;
+    ft.dwHighDateTime = uli.HighPart;
+    SYSTEMTIME utc{}, local{};
+    FileTimeToSystemTime(&ft, &utc);
+    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+    static const wchar_t* weekdays[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
+        L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
+    if (local.wDayOfWeek <= 6) return weekdays[local.wDayOfWeek];
+    return L"--";
+}
+
 // =====================================================================
 // GDI+ init
 // =====================================================================
@@ -254,6 +288,8 @@ struct PluginOptions {
     bool showReset = true;
     bool showSubscription = true;
     bool showStatus = true;
+    bool showClaude7dReset = false; // show Claude 7d reset weekday
+    bool showCodex7dReset = false;  // show Codex 7d reset weekday
     std::string customSubExpiry;    // user-set date, e.g. "2026-12-20"
 };
 
@@ -264,6 +300,7 @@ struct DashData {
     int c5 = -1, c7 = -1, x7 = -1;
     std::string c5Reset;
     std::string c7Reset;
+    long long x7ResetUnix = 0;   // Codex 7d reset unix timestamp
     double lastOk = 0;
     bool stale = false;
     double staleAge = 0;
@@ -435,6 +472,16 @@ public:
             curX += bw + m.infoGap;
         }
 
+        // ── 7d reset weekday blocks ──
+        if (opts.showClaude7dReset) {
+            std::wstring wd = snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset);
+            block(L"Claude\u91CD\u7F6E", wd.c_str());
+        }
+        if (opts.showCodex7dReset) {
+            std::wstring wd = UnixToWeekday(snap.x7ResetUnix);
+            block(L"Codex\u91CD\u7F6E", wd.c_str());
+        }
+
         // ── Separator 2 + status (only show when stale) ──
         if (opts.showStatus && snap.stale && snap.staleAge > 0) {
             curX += m.sepMargin;
@@ -504,8 +551,10 @@ public:
                 d.decPlaces = claude.decimalPlaces;
                 d.subStatus = claude.subscriptionStatus;
             }
-            if (codex.success && codex.weekly.remainingPercent >= 0 && codex.weekly.remainingPercent <= 100)
+            if (codex.success && codex.weekly.remainingPercent >= 0 && codex.weekly.remainingPercent <= 100) {
                 d.x7 = 100 - codex.weekly.remainingPercent;
+                d.x7ResetUnix = codex.weekly.resetAtUnixSeconds;
+            }
             double t = (double)time(nullptr);
             d.stale = (!claude.success && !codex.success) || (d.lastOk > 0 && t - d.lastOk > 900);
             if (d.lastOk > 0) d.staleAge = t - d.lastOk;
@@ -599,6 +648,12 @@ private:
 
         GetPrivateProfileStringW(L"AIUsage", L"ShowStatus", L"1", buf, 256, iniPath.c_str());
         o.showStatus = (buf[0] == L'1');
+
+        GetPrivateProfileStringW(L"AIUsage", L"ShowClaude7dReset", L"0", buf, 256, iniPath.c_str());
+        o.showClaude7dReset = (buf[0] == L'1');
+
+        GetPrivateProfileStringW(L"AIUsage", L"ShowCodex7dReset", L"0", buf, 256, iniPath.c_str());
+        o.showCodex7dReset = (buf[0] == L'1');
 
         GetPrivateProfileStringW(L"AIUsage", L"CustomSubExpiry", L"", buf, 256, iniPath.c_str());
         // Convert wide to narrow
