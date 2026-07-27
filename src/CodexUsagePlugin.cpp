@@ -14,6 +14,8 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <cwctype>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -93,8 +95,14 @@ constexpr COLORREF TEXT_VALUE    = RGB(240, 240, 242);  // #f0f0f2
 constexpr COLORREF SEP_COLOR     = RGB(31, 31, 31);     // rgba(255,255,255,0.12) on dark
 constexpr COLORREF DOT_RED       = RGB(220, 60, 60);    // #dc3c3c
 constexpr COLORREF DOT_GREEN     = RGB(46, 168, 74);    // #2ea84a
+constexpr COLORREF DOT_YELLOW    = RGB(224, 170, 45);   // source data is 1-5 minutes old
 constexpr COLORREF STALE_CLR     = RGB(220, 60, 60);
 constexpr COLORREF RING_NO_DATA  = RGB(60, 60, 63);
+
+Gdiplus::Color ToGdiColor(COLORREF color) {
+    return Gdiplus::Color(
+        255, GetRValue(color), GetGValue(color), GetBValue(color));
+}
 
 COLORREF GaugeColor(int pct, bool isClaude) {
     if (pct < 0) return RING_NO_DATA;
@@ -115,124 +123,69 @@ std::wstring ToWide(const std::string& s) {
     return out;
 }
 
-std::wstring IsoToLocalTimeW(const std::string& iso) {
-    if (iso.empty()) return L"--";
+bool UnixToLocalSystemTime(long long unixSeconds, SYSTEMTIME* local) {
+    if (unixSeconds < 0 || local == nullptr) return false;
+    constexpr ULONGLONG kWindowsEpoch = 116444736000000000ULL;
+    constexpr ULONGLONG kTicksPerSecond = 10000000ULL;
+    const ULONGLONG seconds = static_cast<ULONGLONG>(unixSeconds);
+    if (seconds > (std::numeric_limits<ULONGLONG>::max() - kWindowsEpoch) / kTicksPerSecond) {
+        return false;
+    }
+
+    ULARGE_INTEGER value{};
+    value.QuadPart = seconds * kTicksPerSecond + kWindowsEpoch;
+    FILETIME fileTime{value.LowPart, value.HighPart};
     SYSTEMTIME utc{};
-    int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
-        &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
-    if (n < 3) return L"--";
+    return FileTimeToSystemTime(&fileTime, &utc)
+        && SystemTimeToTzSpecificLocalTime(nullptr, &utc, local);
+}
+
+bool IsoToLocalSystemTime(const std::string& iso, SYSTEMTIME* local) {
+    const auto unixSeconds = ParseIso8601UtcSeconds(iso);
+    return unixSeconds.has_value() && UnixToLocalSystemTime(*unixSeconds, local);
+}
+
+std::wstring IsoToLocalTimeW(const std::string& iso) {
     SYSTEMTIME local{};
-    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+    if (!IsoToLocalSystemTime(iso, &local)) return L"--";
     wchar_t buf[16];
     swprintf_s(buf, L"%02d:%02d", (int)local.wHour, (int)local.wMinute);
     return buf;
 }
 
-std::wstring IsoToLocalDateW(const std::string& iso) {
-    if (iso.empty()) return L"--";
-    SYSTEMTIME utc{};
-    int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
-        &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
-    if (n < 3) return L"--";
-    SYSTEMTIME local{};
-    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
-    wchar_t buf[16];
-    swprintf_s(buf, L"%d\u6708%d\u65E5", (int)local.wMonth, (int)local.wDay);
+std::wstring IsoToCompactDateW(const std::string& iso) {
+    if (iso.size() != 10 || !ParseIso8601UtcSeconds(iso).has_value()) return L"--";
+    wchar_t buf[12];
+    swprintf_s(buf, L"%d.%d", std::stoi(iso.substr(5, 2)), std::stoi(iso.substr(8, 2)));
     return buf;
 }
 
-std::wstring FormatStaleAge(double sec) {
-    if (sec < 60) return L"\u8FC7\u671F<1m";
-    if (sec < 3600) {
-        wchar_t b[16]; swprintf_s(b, L"\u8FC7\u671F%dm", (int)(sec / 60));
-        return b;
-    }
-    wchar_t b[24];
-    swprintf_s(b, L"\u8FC7\u671F%dh%02dm", (int)(sec / 3600), ((int)sec % 3600) / 60);
-    return b;
-}
-
-// ISO 8601 date -> weekday in Chinese (周一, 周二, ... 周日)
+// ISO 8601 date -> single-character Chinese weekday (一, 二, ... 日)
 std::wstring IsoToWeekday(const std::string& iso) {
-    if (iso.empty()) return L"--";
-    SYSTEMTIME utc{};
-    int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
-        &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
-    if (n < 3) return L"--";
     SYSTEMTIME local{};
-    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+    if (!IsoToLocalSystemTime(iso, &local)) return L"--";
     // Day of week: 0=Sun, 1=Mon, ... 6=Sat
-    static const wchar_t* weekdays[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
-        L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
-    // Use SystemTime day of week if available, otherwise calculate
-    if (local.wDayOfWeek <= 6) return weekdays[local.wDayOfWeek];
-    return L"--";
+    static const wchar_t* weekdays[] = {
+        L"\u65E5", L"\u4E00", L"\u4E8C", L"\u4E09", L"\u56DB", L"\u4E94", L"\u516D" };
+    return weekdays[local.wDayOfWeek];
 }
 
-// Format 7d reset countdown: "周三 14:32" or "5h30m" or "23m"
+// Format 7d reset countdown: "5h30m" or "23m".
 // Returns {text, isUrgent} where isUrgent = true if < 2h
-std::pair<std::wstring, bool> Format7dCountdown(const std::string& iso, long long unixSec) {
-    double now = (double)time(nullptr);
-    double resetAt = 0;
-
-    if (!iso.empty()) {
-        SYSTEMTIME utc{};
-        int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
-            &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
-        if (n >= 3) {
-            SYSTEMTIME local{};
-            SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
-            FILETIME ft{};
-            SystemTimeToFileTime(&local, &ft);
-            ULARGE_INTEGER uli;
-            uli.LowPart = ft.dwLowDateTime;
-            uli.HighPart = ft.dwHighDateTime;
-            resetAt = (double)(uli.QuadPart - 116444736000000000ULL) / 10000000.0;
-        }
-    } else if (unixSec > 0) {
-        resetAt = (double)unixSec;
-    }
-
+std::pair<std::wstring, bool> Format7dCountdown(
+    const std::string& iso, long long unixSec, int showBeforeHours) {
+    const long long now = static_cast<long long>(time(nullptr));
+    long long resetAt = 0;
+    const auto claudeReset = ParseIso8601UtcSeconds(iso);
+    if (claudeReset.has_value() && *claudeReset > now) resetAt = *claudeReset;
+    if (unixSec > now && (resetAt == 0 || unixSec < resetAt)) resetAt = unixSec;
     if (resetAt <= now) return { L"--", false };
-    double diff = resetAt - now;
-
-    // If > 24h, show weekday + time
-    if (diff > 86400) {
-        // Parse the time to get weekday and HH:MM
-        if (!iso.empty()) {
-            SYSTEMTIME utc{};
-            int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
-                &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
-            if (n >= 5) {
-                SYSTEMTIME local{};
-                SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
-                static const wchar_t* wd[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
-                    L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
-                wchar_t buf[32];
-                swprintf_s(buf, L"%s %02d:%02d", wd[local.wDayOfWeek], local.wHour, local.wMinute);
-                return { buf, false };
-            }
-        }
-        if (unixSec > 0) {
-            FILETIME ft{};
-            ULARGE_INTEGER uli;
-            uli.QuadPart = (ULONGLONG)((double)unixSec * 1e7 + 116444736000000000ULL);
-            ft.dwLowDateTime = uli.LowPart; ft.dwHighDateTime = uli.HighPart;
-            SYSTEMTIME utc{}, local{};
-            FileTimeToSystemTime(&ft, &utc);
-            SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
-            static const wchar_t* wd[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
-                L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
-            wchar_t buf[32];
-            swprintf_s(buf, L"%s %02d:%02d", wd[local.wDayOfWeek], local.wHour, local.wMinute);
-            return { buf, false };
-        }
-        return { L"--", false };
-    }
+    const long long diff = resetAt - now;
+    if (!ShouldShowCountdown(diff, showBeforeHours)) return { L"--", false };
 
     // < 24h: show countdown
-    int h = (int)(diff / 3600);
-    int m = ((int)diff % 3600) / 60;
+    const int h = static_cast<int>(diff / 3600);
+    const int m = static_cast<int>((diff % 3600) / 60);
     wchar_t buf[32];
     if (h > 0)
         swprintf_s(buf, L"%dh%02dm", h, m);
@@ -243,19 +196,11 @@ std::pair<std::wstring, bool> Format7dCountdown(const std::string& iso, long lon
 
 // Unix timestamp -> weekday in Chinese
 std::wstring UnixToWeekday(long long unixSec) {
-    if (unixSec <= 0) return L"--";
-    FILETIME ft{};
-    ULARGE_INTEGER uli;
-    uli.QuadPart = static_cast<ULONGLONG>((double)unixSec * 10000000.0 + 116444736000000000ULL);
-    ft.dwLowDateTime = uli.LowPart;
-    ft.dwHighDateTime = uli.HighPart;
-    SYSTEMTIME utc{}, local{};
-    FileTimeToSystemTime(&ft, &utc);
-    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
-    static const wchar_t* weekdays[] = { L"\u5468\u65E5", L"\u5468\u4E00", L"\u5468\u4E8C",
-        L"\u5468\u4E09", L"\u5468\u56DB", L"\u5468\u4E94", L"\u5468\u516D" };
-    if (local.wDayOfWeek <= 6) return weekdays[local.wDayOfWeek];
-    return L"--";
+    SYSTEMTIME local{};
+    if (!UnixToLocalSystemTime(unixSec, &local)) return L"--";
+    static const wchar_t* weekdays[] = {
+        L"\u65E5", L"\u4E00", L"\u4E8C", L"\u4E09", L"\u56DB", L"\u4E94", L"\u516D" };
+    return weekdays[local.wDayOfWeek];
 }
 
 // =====================================================================
@@ -358,12 +303,14 @@ struct PluginOptions {
     bool showPctSign = false;       // default: hide %
     bool showCredits = true;
     bool showReset = true;
-    bool showSubscription = true;
+    bool showSubscription = false;
+    bool showCustomExpiry = true;
     bool showStatus = true;
-    bool showClaude7dReset = false; // show Claude 7d reset weekday
-    bool showCodex7dReset = false;  // show Codex 7d reset weekday
-    bool show7dCountdown = false;    // 7d reset countdown (穿透显示)
-    std::string customSubExpiry;    // user-set date, e.g. "2026-12-20"
+    bool showClaude7dReset = true;  // show Claude 7d reset weekday
+    bool showCodex7dReset = true;   // show Codex 7d reset weekday
+    bool show7dCountdown = true;    // show the nearest 7d reset
+    int countdownShowBeforeHours = 12;
+    std::string customSubExpiry = "2026-08-13";
 };
 
 // =====================================================================
@@ -374,14 +321,80 @@ struct DashData {
     std::string c5Reset;
     std::string c7Reset;
     long long x7ResetUnix = 0;   // Codex 7d reset unix timestamp
-    double lastOk = 0;
-    bool stale = false;
-    double staleAge = 0;
     long long usedCredits = 0;
     std::string currency;
     int decPlaces = 2;
     std::string subStatus;
+    double lastClaudeOk = 0;
+    double lastCodexOk = 0;
+    bool claudeAvailable = false;
+    bool codexAvailable = false;
 };
+
+std::wstring FormatCredits(const DashData& data) {
+    if (!data.claudeAvailable) return L"--";
+    const int decimalPlaces = std::clamp(data.decPlaces, 0, 9);
+    const double amount = data.usedCredits / pow(10.0, decimalPlaces);
+    wchar_t number[32];
+    swprintf_s(number, L"%.2f", amount);
+    std::wstring currency = ToWide(data.currency);
+    std::transform(currency.begin(), currency.end(), currency.begin(), towupper);
+    if (currency.empty() || currency == L"USD") return L"$" + std::wstring(number);
+    return currency + L" " + number;
+}
+
+std::wstring FormatSubscriptionStatus(const DashData& data) {
+    if (data.subStatus == "active") return L"\u6B63\u5E38";
+    if (data.subStatus == "trialing") return L"\u8BD5\u7528";
+    if (data.subStatus == "canceled") return L"\u5DF2\u53D6\u6D88";
+    if (data.subStatus == "past_due") return L"\u903E\u671F";
+    if (data.subStatus == "paused") return L"\u5DF2\u6682\u505C";
+    return L"--";
+}
+
+double SourceAge(bool available, double lastSuccess) {
+    if (!available || lastSuccess <= 0) return 0;
+    return std::max(0.0, static_cast<double>(time(nullptr)) - lastSuccess);
+}
+
+COLORREF FreshnessDotColor(bool available, double lastSuccess) {
+    const FreshnessLevel level = ClassifyFreshness(SourceAge(available, lastSuccess));
+    if (level == FreshnessLevel::Warning) return DOT_YELLOW;
+    if (level == FreshnessLevel::Stale) return DOT_RED;
+    return 0;
+}
+
+std::wstring FormatSourceAge(const wchar_t* source, double ageSeconds) {
+    if (ClassifyFreshness(ageSeconds) == FreshnessLevel::Fresh) return {};
+    wchar_t buffer[32];
+    if (ageSeconds < 3600) {
+        swprintf_s(buffer, L"%s\u8FC7\u671F%dm", source, std::max(1, static_cast<int>(ageSeconds / 60)));
+    } else {
+        swprintf_s(buffer, L"%s\u8FC7\u671F%dh%02dm", source,
+            static_cast<int>(ageSeconds / 3600), (static_cast<int>(ageSeconds) % 3600) / 60);
+    }
+    return buffer;
+}
+
+std::wstring BuildFreshnessText(const DashData& data) {
+    const std::wstring claude = FormatSourceAge(
+        L"C", SourceAge(data.claudeAvailable, data.lastClaudeOk));
+    const std::wstring codex = FormatSourceAge(
+        L"X", SourceAge(data.codexAvailable, data.lastCodexOk));
+    if (claude.empty()) return codex;
+    if (codex.empty()) return claude;
+    return claude + L" " + codex;
+}
+
+COLORREF OverallFreshnessColor(const DashData& data) {
+    const FreshnessLevel claude = ClassifyFreshness(
+        SourceAge(data.claudeAvailable, data.lastClaudeOk));
+    const FreshnessLevel codex = ClassifyFreshness(
+        SourceAge(data.codexAvailable, data.lastCodexOk));
+    if (claude == FreshnessLevel::Stale || codex == FreshnessLevel::Stale) return DOT_RED;
+    if (claude == FreshnessLevel::Warning || codex == FreshnessLevel::Warning) return DOT_YELLOW;
+    return 0;
+}
 
 // =====================================================================
 // Main custom-drawn item
@@ -395,22 +408,90 @@ public:
     const wchar_t* GetItemValueSampleText() const override { return L""; }
     bool IsCustomDraw() const override { return true; }
 
-    int GetItemWidth() const override { return cachedW_ > 0 ? cachedW_ : 360; }
+    int GetItemWidth() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (cachedW_ > 0) return cachedW_;
+        // Fallback for hosts that do not call GetItemWidthEx. This estimate is
+        // based on enabled blocks instead of a fixed width that clips the tail.
+        int width = 132;
+        if (opts_.showCredits) width += 45;
+        if (opts_.showReset) width += 48;
+        if (opts_.showSubscription) width += 55;
+        if (opts_.showCustomExpiry) width += 45;
+        if (opts_.showClaude7dReset) width += 45;
+        if (opts_.showCodex7dReset) width += 45;
+        if (opts_.show7dCountdown
+            && Format7dCountdown(data_.c7Reset, data_.x7ResetUnix,
+                                 opts_.countdownShowBeforeHours).first != L"--") {
+            width += 55;
+        }
+        if (opts_.showStatus && !BuildFreshnessText(data_).empty()) width += 90;
+        return width;
+    }
 
     int GetItemWidthEx(void* hDC) const override {
-        // After first draw, return actual measured width
-        if (cachedW_ > 0) return cachedW_;
-        // Minimal initial estimate — will be corrected after first draw
-        if (!hDC) return 200;
+        if (!hDC) return GetItemWidth();
         HDC hdc = (HDC)hDC;
         int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
         if (dpi < 72) dpi = 96;
-        return 200 * dpi / 96;
+        const LM m = GetMetrics(dpi);
+        DashData snap;
+        PluginOptions opts;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            snap = data_;
+            opts = opts_;
+        }
+
+        Gdiplus::Graphics g(hdc);
+        const wchar_t* ff = L"Segoe UI";
+        int width = m.padX + 3 * (m.ringD + m.ringGap) + 2 * m.sepMargin;
+        const auto addBlock = [&](const wchar_t* label, const std::wstring& value, int valueExtra = 0) {
+            width += std::max(TextWidth(g, label, ff, (float)m.infoLabelSize, false),
+                              TextWidth(g, value.c_str(), ff, (float)m.infoValueSize, true) + valueExtra)
+                   + m.infoGap;
+        };
+        if (opts.showCredits) addBlock(L"Credits", FormatCredits(snap));
+        if (opts.showReset) {
+            addBlock(L"5h\u91CD\u7F6E", snap.c5Reset.empty() ? L"--" : IsoToLocalTimeW(snap.c5Reset));
+        }
+        if (opts.showSubscription) {
+            const bool hasStatusDot = snap.subStatus == "active" || snap.subStatus == "trialing"
+                || snap.subStatus == "canceled" || snap.subStatus == "past_due"
+                || snap.subStatus == "paused";
+            addBlock(L"\u8BA2\u9605", FormatSubscriptionStatus(snap),
+                     hasStatusDot ? m.dotSize + m.dotGap : 0);
+        }
+        if (opts.showCustomExpiry) {
+            addBlock(L"\u5230\u671F", IsoToCompactDateW(opts.customSubExpiry));
+        }
+        if (opts.showClaude7dReset) {
+            addBlock(L"Claude", snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset));
+        }
+        if (opts.showCodex7dReset) addBlock(L"Codex", UnixToWeekday(snap.x7ResetUnix));
+        if (opts.show7dCountdown) {
+            auto [value, urgent] = Format7dCountdown(
+                snap.c7Reset, snap.x7ResetUnix, opts.countdownShowBeforeHours);
+            if (value != L"--") addBlock(L"7d\u91CD\u7F6E", value);
+        }
+        const std::wstring freshnessText = BuildFreshnessText(snap);
+        if (opts.showStatus && !freshnessText.empty()) {
+            width += 2 * m.sepMargin;
+            width += TextWidth(g, freshnessText.c_str(), ff, (float)m.staleSize, true);
+        }
+        width += m.padX;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            cachedW_ = width;
+        }
+        return width;
     }
 
     void DrawItem(void* hDC, int x, int y, int w, int h, bool dark) override {
         HDC hdc = (HDC)hDC;
         if (!hdc) return;
+        const int savedDc = SaveDC(hdc);
+        if (w > 0 && h > 0) IntersectClipRect(hdc, x, y, x + w, y + h);
         int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
         if (dpi < 72) dpi = 96;
         LM m = GetMetrics(dpi);
@@ -431,13 +512,12 @@ public:
         const wchar_t* ff = L"Segoe UI";
         int cy = y + h / 2;
         int curX = x + m.padX;
-        Gdiplus::Color cPct(TEXT_PCT);
-        Gdiplus::Color cLabel(TEXT_LABEL);
-        Gdiplus::Color cValue(TEXT_VALUE);
-        Gdiplus::Color cSub(TEXT_LABEL);
+        Gdiplus::Color cPct = ToGdiColor(TEXT_PCT);
+        Gdiplus::Color cLabel = ToGdiColor(TEXT_LABEL);
+        Gdiplus::Color cValue = ToGdiColor(TEXT_VALUE);
 
         // ── Ring gauges ──
-        auto ring = [&](int pct, COLORREF clr, const wchar_t* tag) {
+        auto ring = [&](int pct, COLORREF clr, const wchar_t* tag, COLORREF statusDot = 0) {
             int rcx = curX + m.ringD / 2;
             int R = m.ringD / 2 - m.ringStroke;
             DrawArc(g, rcx, cy, R, m.ringStroke, std::max(0, pct), RING_TRACK,
@@ -460,12 +540,21 @@ public:
             float ly = (float)(cy - m.ringD / 2 + m.labelOffsetY);
             DrawTextAt(g, tag, lx, ly, ff, (float)m.labelSize,
                        Gdiplus::Color(178, 178, 178), true);
+            if (opts.showStatus && statusDot != 0) {
+                const int badgeR = std::max(2, m.dotSize / 2);
+                DrawDot(g, curX + m.ringD - badgeR, cy + m.ringD / 2 - badgeR,
+                        badgeR, statusDot);
+            }
             curX += m.ringD + m.ringGap;
         };
 
-        ring(snap.c5, GaugeColor(snap.c5, true), L"5h");
+        const COLORREF claudeFreshness = FreshnessDotColor(
+            snap.claudeAvailable, snap.lastClaudeOk);
+        const COLORREF codexFreshness = FreshnessDotColor(
+            snap.codexAvailable, snap.lastCodexOk);
+        ring(snap.c5, GaugeColor(snap.c5, true), L"5h", claudeFreshness);
         ring(snap.c7, GaugeColor(snap.c7, true), L"7d");
-        ring(snap.x7, GaugeColor(snap.x7, false), L"7d");
+        ring(snap.x7, GaugeColor(snap.x7, false), L"7d", codexFreshness);
 
         // ── Separator 1 ──
         curX += m.sepMargin;
@@ -490,13 +579,7 @@ public:
         };
 
         if (opts.showCredits) {
-            std::wstring cv = L"--";
-            if (snap.usedCredits > 0) {
-                double amt = snap.usedCredits / pow(10.0, snap.decPlaces);
-                wchar_t cb[24];
-                swprintf_s(cb, L"$%.2f", amt);
-                cv = cb;
-            }
+            std::wstring cv = FormatCredits(snap);
             block(L"Credits", cv.c_str());
         }
 
@@ -506,18 +589,11 @@ public:
         }
 
         if (opts.showSubscription) {
-            // Use custom date if set, otherwise use API date
-            std::wstring dateStr = L"--";
-            if (!opts.customSubExpiry.empty()) {
-                dateStr = IsoToLocalDateW(opts.customSubExpiry);
-            } else if (!snap.c7Reset.empty()) {
-                dateStr = IsoToLocalDateW(snap.c7Reset);
-            }
+            std::wstring dateStr = FormatSubscriptionStatus(snap);
             // Status dot: red = canceled/expired, green = active
             bool isCanceled = (snap.subStatus == "canceled" || snap.subStatus == "past_due"
                             || snap.subStatus == "paused");
             bool isActive = (snap.subStatus == "active" || snap.subStatus == "trialing");
-            const wchar_t* subLine = nullptr;
             COLORREF dotClr = 0;
             if (isCanceled) { dotClr = DOT_RED; }
             else if (isActive) { dotClr = DOT_GREEN; }
@@ -540,23 +616,28 @@ public:
             curX += bw + m.infoGap;
         }
 
+        if (opts.showCustomExpiry) {
+            const std::wstring expiry = IsoToCompactDateW(opts.customSubExpiry);
+            block(L"\u5230\u671F", expiry.c_str());
+        }
+
         // ── 7d reset weekday blocks ──
         if (opts.showClaude7dReset) {
             std::wstring wd = snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset);
-            block(L"Claude\u91CD\u7F6E", wd.c_str());
+            block(L"Claude", wd.c_str());
         }
         if (opts.showCodex7dReset) {
             std::wstring wd = UnixToWeekday(snap.x7ResetUnix);
-            block(L"Codex\u91CD\u7F6E", wd.c_str());
+            block(L"Codex", wd.c_str());
         }
 
-        // ── 7d reset countdown (穿透显示) ──
+        // ── Nearest 7d reset time/countdown ──
         if (opts.show7dCountdown) {
-            // Use Claude 7d reset if available, otherwise Codex
-            auto [countdown, urgent] = Format7dCountdown(snap.c7Reset, snap.x7ResetUnix);
+            auto [countdown, urgent] = Format7dCountdown(
+                snap.c7Reset, snap.x7ResetUnix, opts.countdownShowBeforeHours);
             if (countdown != L"--") {
                 Gdiplus::Color valColor = urgent
-                    ? Gdiplus::Color(STALE_CLR)  // red when < 2h
+                    ? ToGdiColor(STALE_CLR)  // red when < 2h
                     : cValue;
                 int by = cy - h / 2 + m.infoPadTop;
                 DrawTextAt(g, L"7d\u91CD\u7F6E", (float)curX, (float)by, ff,
@@ -569,23 +650,32 @@ public:
             }
         }
 
-        // ── Separator 2 + status (only show when stale) ──
-        if (opts.showStatus && snap.stale && snap.staleAge > 0) {
+        // ── Separator 2 + per-source freshness status ──
+        const std::wstring freshnessText = BuildFreshnessText(snap);
+        if (opts.showStatus && !freshnessText.empty()) {
             curX += m.sepMargin;
             DrawLine(g, curX, cy - m.sepH / 2, cy + m.sepH / 2, SEP_COLOR);
             curX += m.sepMargin;
-            std::wstring st = FormatStaleAge(snap.staleAge);
-            DrawTextAt(g, st.c_str(), (float)curX, (float)(cy - m.staleSize / 2),
-                       ff, (float)m.staleSize, Gdiplus::Color(STALE_CLR), true);
-            curX += TextWidth(g, st.c_str(), ff, (float)m.staleSize, true);
+            const COLORREF freshnessColor = OverallFreshnessColor(snap);
+            DrawTextAt(g, freshnessText.c_str(), (float)curX, (float)(cy - m.staleSize / 2),
+                       ff, (float)m.staleSize, ToGdiColor(freshnessColor), true);
+            curX += TextWidth(g, freshnessText.c_str(), ff, (float)m.staleSize, true);
         }
 
-        cachedW_ = curX + m.padX - x;
+        if (savedDc != 0) RestoreDC(hdc, savedDc);
     }
 
-    void SetSnapshot(const DashData& d) { std::lock_guard<std::mutex> lk(mu_); data_ = d; }
-    void SetOptions(const PluginOptions& o) { std::lock_guard<std::mutex> lk(mu_); opts_ = o; }
-    const PluginOptions& GetOptions() const { std::lock_guard<std::mutex> lk(mu_); return opts_; }
+    void SetSnapshot(const DashData& d) {
+        std::lock_guard<std::mutex> lk(mu_);
+        data_ = d;
+        cachedW_ = 0;
+    }
+    void SetOptions(const PluginOptions& o) {
+        std::lock_guard<std::mutex> lk(mu_);
+        opts_ = o;
+        cachedW_ = 0;
+    }
+    PluginOptions GetOptions() const { std::lock_guard<std::mutex> lk(mu_); return opts_; }
     DashData GetSnapshot() const { std::lock_guard<std::mutex> lk(mu_); return data_; }
 
 private:
@@ -616,25 +706,26 @@ public:
         std::thread([this]() {
             auto claude = claude_.Fetch();
             auto codex = codex_.Fetch();
-            DashData d;
+            DashData d = dash_.GetSnapshot();
+            const double t = static_cast<double>(time(nullptr));
             if (claude.success) {
                 d.c5 = std::clamp(claude.fiveHourPercent, -1, 100);
                 d.c7 = std::clamp(claude.sevenDayPercent, -1, 100);
                 d.c5Reset = claude.fiveHourResetAt;
                 d.c7Reset = claude.sevenDayResetAt;
-                d.lastOk = claude.lastSuccessTime;
                 d.usedCredits = claude.usedCredits;
                 d.currency = claude.currency;
                 d.decPlaces = claude.decimalPlaces;
                 d.subStatus = claude.subscriptionStatus;
+                d.claudeAvailable = true;
+                d.lastClaudeOk = claude.lastSuccessTime > 0 ? claude.lastSuccessTime : t;
             }
             if (codex.success && codex.weekly.remainingPercent >= 0 && codex.weekly.remainingPercent <= 100) {
                 d.x7 = 100 - codex.weekly.remainingPercent;
                 d.x7ResetUnix = codex.weekly.resetAtUnixSeconds;
+                d.codexAvailable = true;
+                d.lastCodexOk = t;
             }
-            double t = (double)time(nullptr);
-            d.stale = (!claude.success && !codex.success) || (d.lastOk > 0 && t - d.lastOk > 900);
-            if (d.lastOk > 0) d.staleAge = t - d.lastOk;
             dash_.SetSnapshot(d);
             std::lock_guard<std::mutex> lk(mu_);
             tip_ = BuildTip(claude, codex);
@@ -646,10 +737,10 @@ public:
         switch (i) {
             case TMI_NAME:        return L"AI Usage";
             case TMI_DESCRIPTION: return L"Claude & Codex usage dashboard.";
-            case TMI_AUTHOR:      return L"Claude+Codex";
+            case TMI_AUTHOR:      return L"B-22";
             case TMI_COPYRIGHT:   return L"MIT";
             case TMI_VERSION:     return CODEX_USAGE_VERSION_WIDE;
-            case TMI_URL:         return L"https://github.com/HCLonely/TrafficMonitor_Codex_Plugin";
+            case TMI_URL:         return L"https://github.com/B-22/TrafficMonitor-AIUsage";
             default:              return L"";
         }
     }
@@ -712,7 +803,8 @@ public:
         wchar_t x7ResetBuf[64];
         swprintf_s(x7ResetBuf, L"%lld", snap.x7ResetUnix);
 
-        wchar_t msg[3072];
+        const std::wstring freshness = BuildFreshnessText(snap);
+        wchar_t msg[4096];
         swprintf_s(msg,
             L"AI Usage Plugin Options\n"
             L"========================================\n\n"
@@ -721,11 +813,13 @@ public:
             L"  2. Show Credits:          %s\n"
             L"  3. Show 5h Reset:         %s\n"
             L"  4. Show Subscription:     %s\n"
-            L"  5. Show Status:           %s\n"
-            L"  6. Show Claude 7d Reset:  %s\n"
-            L"  7. Show Codex 7d Reset:   %s\n"
-            L"  8. Show 7d Countdown:     %s\n"
-            L"  9. Custom Sub Expiry:     %s\n\n"
+            L"  5. Show Custom Expiry:    %s\n"
+            L"  6. Show Freshness Status: %s\n"
+            L"  7. Show Claude Weekday:   %s\n"
+            L"  8. Show Codex Weekday:    %s\n"
+            L"  9. Show 7d Countdown:     %s\n"
+            L" 10. Countdown Threshold:   %d hours\n"
+            L" 11. Custom Sub Expiry:     %s\n\n"
             L"Proxy Settings:\n"
             L"  Proxy Server:   %s\n"
             L"  Require Proxy:  %s\n\n"
@@ -740,28 +834,32 @@ public:
             L"  Claude 7d Reset: %s\n"
             L"  Codex 7d%%:     %d\n"
             L"  Codex 7d Reset:  %s\n"
-            L"  Data OK:         %s\n\n"
+            L"  Freshness:       %s\n\n"
             L"To change settings, edit AIUsage.ini:\n"
             L"  [AIUsage]\n"
             L"  ShowPctSign=0\n"
             L"  ShowCredits=1\n"
             L"  ShowReset=1\n"
-            L"  ShowSubscription=1\n"
+            L"  ShowSubscription=0\n"
+            L"  ShowCustomExpiry=1\n"
             L"  ShowStatus=1\n"
             L"  ShowClaude7dReset=1\n"
             L"  ShowCodex7dReset=1\n"
             L"  Show7dCountdown=1\n"
-            L"  CustomSubExpiry=2026-12-20\n"
+            L"  CountdownShowBeforeHours=12\n"
+            L"  CustomSubExpiry=2026-08-13\n"
             L"  ProxyServer=127.0.0.1:7890\n"
             L"  RequireProxy=0",
             o.showPctSign ? L"Yes" : L"No",
             o.showCredits ? L"Yes" : L"No",
             o.showReset ? L"Yes" : L"No",
             o.showSubscription ? L"Yes" : L"No",
+            o.showCustomExpiry ? L"Yes" : L"No",
             o.showStatus ? L"Yes" : L"No",
             o.showClaude7dReset ? L"Yes" : L"No",
             o.showCodex7dReset ? L"Yes" : L"No",
             o.show7dCountdown ? L"Yes" : L"No",
+            o.countdownShowBeforeHours,
             o.customSubExpiry.empty() ? L"(auto)" : std::wstring(o.customSubExpiry.begin(), o.customSubExpiry.end()).c_str(),
             proxyServer.empty() ? L"(system)" : proxyServer.c_str(),
             requireProxy ? L"Yes" : L"No",
@@ -773,7 +871,7 @@ public:
             c7ResetBuf,
             snap.x7,
             x7ResetBuf,
-            snap.stale ? L"Stale" : L"OK");
+            freshness.empty() ? L"Fresh" : freshness.c_str());
         MessageBoxW(parent, msg, L"AI Usage Options", MB_OK | MB_ICONINFORMATION);
         return OR_OPTION_UNCHANGED;
     }
@@ -803,23 +901,33 @@ private:
         GetPrivateProfileStringW(L"AIUsage", L"ShowReset", L"1", buf, 256, iniPath.c_str());
         o.showReset = (buf[0] == L'1');
 
-        GetPrivateProfileStringW(L"AIUsage", L"ShowSubscription", L"1", buf, 256, iniPath.c_str());
+        GetPrivateProfileStringW(L"AIUsage", L"ShowSubscription", L"0", buf, 256, iniPath.c_str());
         o.showSubscription = (buf[0] == L'1');
+
+        GetPrivateProfileStringW(L"AIUsage", L"ShowCustomExpiry", L"1", buf, 256, iniPath.c_str());
+        o.showCustomExpiry = (buf[0] == L'1');
 
         GetPrivateProfileStringW(L"AIUsage", L"ShowStatus", L"1", buf, 256, iniPath.c_str());
         o.showStatus = (buf[0] == L'1');
 
-        GetPrivateProfileStringW(L"AIUsage", L"ShowClaude7dReset", L"0", buf, 256, iniPath.c_str());
+        GetPrivateProfileStringW(L"AIUsage", L"ShowClaude7dReset", L"1", buf, 256, iniPath.c_str());
         o.showClaude7dReset = (buf[0] == L'1');
 
-        GetPrivateProfileStringW(L"AIUsage", L"ShowCodex7dReset", L"0", buf, 256, iniPath.c_str());
+        GetPrivateProfileStringW(L"AIUsage", L"ShowCodex7dReset", L"1", buf, 256, iniPath.c_str());
         o.showCodex7dReset = (buf[0] == L'1');
 
-        GetPrivateProfileStringW(L"AIUsage", L"Show7dCountdown", L"0", buf, 256, iniPath.c_str());
+        GetPrivateProfileStringW(L"AIUsage", L"Show7dCountdown", L"1", buf, 256, iniPath.c_str());
         o.show7dCountdown = (buf[0] == L'1');
 
-        GetPrivateProfileStringW(L"AIUsage", L"CustomSubExpiry", L"", buf, 256, iniPath.c_str());
+        o.countdownShowBeforeHours = std::clamp(
+            static_cast<int>(GetPrivateProfileIntW(
+                L"AIUsage", L"CountdownShowBeforeHours", 12, iniPath.c_str())),
+            1, 168);
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"CustomSubExpiry", L"2026-08-13", buf, 256, iniPath.c_str());
         // Convert wide to narrow
+        o.customSubExpiry.clear();
         int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
         if (len > 1) {
             o.customSubExpiry.resize(len - 1);
@@ -855,18 +963,11 @@ private:
         }
 
         auto addReset = [&](const std::string& iso) -> std::wstring {
-            if (iso.empty()) return L"--";
-            SYSTEMTIME utc{};
-            int n = sscanf_s(iso.c_str(), "%hu-%hu-%huT%hu:%hu:%hu",
-                &utc.wYear, &utc.wMonth, &utc.wDay, &utc.wHour, &utc.wMinute, &utc.wSecond);
-            if (n < 3) return L"--";
             SYSTEMTIME loc{};
-            SystemTimeToTzSpecificLocalTime(nullptr, &utc, &loc);
+            if (!IsoToLocalSystemTime(iso, &loc)) return L"--";
             wchar_t b[48];
-            if (n >= 5)
-                swprintf_s(b, L"%04d-%02d-%02d %02d:%02d", loc.wYear, loc.wMonth, loc.wDay, loc.wHour, loc.wMinute);
-            else
-                swprintf_s(b, L"%04d-%02d-%02d", loc.wYear, loc.wMonth, loc.wDay);
+            swprintf_s(b, L"%04d-%02d-%02d %02d:%02d",
+                loc.wYear, loc.wMonth, loc.wDay, loc.wHour, loc.wMinute);
             return b;
         };
         if (c.success) {
@@ -900,16 +1001,13 @@ private:
                 if (w.remainingPercent < 0) { t += std::wstring(n) + L": --\n"; return; }
                 t += std::wstring(n) + L": " + std::to_wstring(100 - w.remainingPercent) + L"% used";
                 if (date && w.resetAtUnixSeconds > 0) {
-                    FILETIME ft{};
-                    ULARGE_INTEGER ul;
-                    ul.QuadPart = (ULONGLONG)((double)w.resetAtUnixSeconds * 1e7 + 116444736000000000ULL);
-                    ft.dwLowDateTime = ul.LowPart; ft.dwHighDateTime = ul.HighPart;
-                    SYSTEMTIME u{}, l{};
-                    FileTimeToSystemTime(&ft, &u);
-                    SystemTimeToTzSpecificLocalTime(nullptr, &u, &l);
-                    wchar_t b[48];
-                    swprintf_s(b, L", resets at %04d-%02d-%02d %02d:%02d", l.wYear, l.wMonth, l.wDay, l.wHour, l.wMinute);
-                    t += b;
+                    SYSTEMTIME local{};
+                    if (UnixToLocalSystemTime(w.resetAtUnixSeconds, &local)) {
+                        wchar_t b[48];
+                        swprintf_s(b, L", resets at %04d-%02d-%02d %02d:%02d",
+                            local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
+                        t += b;
+                    }
                 } else if (w.resetAfterSeconds > 0) {
                     wchar_t b[32];
                     swprintf_s(b, L", in %dh%dm", w.resetAfterSeconds / 3600, (w.resetAfterSeconds % 3600) / 60);

@@ -5,6 +5,8 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
 
 namespace {
 
@@ -114,6 +116,97 @@ UsageSnapshot ParseUsageJson(const std::string& jsonText, std::wstring* errorMes
 
     snapshot.success = true;
     return snapshot;
+}
+
+std::optional<long long> ParseIso8601UtcSeconds(const std::string& text) {
+    // Accept the forms used by the Claude API:
+    // YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS[.fraction]][Z|+HH:MM|-HH:MM].
+    if (text.size() < 10 || text[4] != '-' || text[7] != '-') {
+        return std::nullopt;
+    }
+
+    const auto parseDigits = [&](size_t offset, size_t count) -> std::optional<int> {
+        if (offset + count > text.size()) return std::nullopt;
+        int value = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const unsigned char ch = static_cast<unsigned char>(text[offset + i]);
+            if (!std::isdigit(ch)) return std::nullopt;
+            value = value * 10 + (ch - '0');
+        }
+        return value;
+    };
+
+    const auto yearValue = parseDigits(0, 4);
+    const auto monthValue = parseDigits(5, 2);
+    const auto dayValue = parseDigits(8, 2);
+    if (!yearValue || !monthValue || !dayValue) return std::nullopt;
+
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    size_t pos = 10;
+    if (pos < text.size()) {
+        if (text[pos] != 'T' && text[pos] != 't' && text[pos] != ' ') return std::nullopt;
+        if (pos + 6 > text.size() || text[pos + 3] != ':') return std::nullopt;
+        const auto hourValue = parseDigits(pos + 1, 2);
+        const auto minuteValue = parseDigits(pos + 4, 2);
+        if (!hourValue || !minuteValue) return std::nullopt;
+        hour = *hourValue;
+        minute = *minuteValue;
+        pos += 6;
+
+        if (pos < text.size() && text[pos] == ':') {
+            const auto secondValue = parseDigits(pos + 1, 2);
+            if (!secondValue) return std::nullopt;
+            second = *secondValue;
+            pos += 3;
+        }
+        if (pos < text.size() && text[pos] == '.') {
+            ++pos;
+            const size_t fractionStart = pos;
+            while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) ++pos;
+            if (pos == fractionStart) return std::nullopt;
+        }
+    }
+
+    int offsetSeconds = 0;
+    if (pos < text.size() && (text[pos] == 'Z' || text[pos] == 'z')) {
+        ++pos;
+    } else if (pos < text.size() && (text[pos] == '+' || text[pos] == '-')) {
+        const int sign = text[pos] == '+' ? 1 : -1;
+        ++pos;
+        const auto offsetHour = parseDigits(pos, 2);
+        if (!offsetHour) return std::nullopt;
+        pos += 2;
+        if (pos < text.size() && text[pos] == ':') ++pos;
+        const auto offsetMinute = parseDigits(pos, 2);
+        if (!offsetMinute || *offsetHour > 23 || *offsetMinute > 59) return std::nullopt;
+        pos += 2;
+        offsetSeconds = sign * (*offsetHour * 3600 + *offsetMinute * 60);
+    }
+    if (pos != text.size() || hour > 23 || minute > 59 || second > 59) {
+        return std::nullopt;
+    }
+
+    using namespace std::chrono;
+    const year_month_day date{
+        year{*yearValue}, month{static_cast<unsigned>(*monthValue)}, day{static_cast<unsigned>(*dayValue)}};
+    if (!date.ok()) return std::nullopt;
+
+    const auto utc = sys_days{date}
+        + hours{hour} + minutes{minute} + seconds{second} - seconds{offsetSeconds};
+    return duration_cast<seconds>(utc.time_since_epoch()).count();
+}
+
+FreshnessLevel ClassifyFreshness(double ageSeconds) {
+    if (ageSeconds >= 5 * 60) return FreshnessLevel::Stale;
+    if (ageSeconds >= 60) return FreshnessLevel::Warning;
+    return FreshnessLevel::Fresh;
+}
+
+bool ShouldShowCountdown(long long secondsRemaining, int showBeforeHours) {
+    if (secondsRemaining <= 0 || showBeforeHours <= 0) return false;
+    return secondsRemaining <= static_cast<long long>(showBeforeHours) * 60 * 60;
 }
 
 std::wstring FormatRemainingPercent(int remainingPercent) {

@@ -30,12 +30,13 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 | 百分比号 | `ShowPctSign` | 隐藏 | 0=只显示数字, 1=显示% |
 | Credits 金额 | `ShowCredits` | 显示 | Claude 超额用量金额 |
 | 5h 重置时间 | `ShowReset` | 显示 | 下次 5h 窗口重置时间 |
-| 订阅到期 | `ShowSubscription` | 显示 | 日期 + 红/绿点状态 |
-| Claude 7d 重置星期 | `ShowClaude7dReset` | 隐藏 | 显示周一~周日 |
-| Codex 7d 重置星期 | `ShowCodex7dReset` | 隐藏 | 显示周一~周日 |
-| 7d 重置倒计时 | `Show7dCountdown` | 隐藏 | 穿透显示，>24h 显示周几+时间，<24h 显示倒计时，<2h 红色 |
-| 过期提示 | `ShowStatus` | 显示 | 数据 >15min 未更新时红色提示 |
-| 自定义订阅日期 | `CustomSubExpiry` | 空 | 手动设置订阅到期日，格式 2026-12-20 |
+| 订阅状态 | `ShowSubscription` | 隐藏 | API 状态的红/绿点和文字 |
+| 手动到期日期 | `ShowCustomExpiry` | 显示 | 独立显示 `CustomSubExpiry`，任务栏格式如 `8.13` |
+| Claude 7d 重置星期 | `ShowClaude7dReset` | 显示 | 标签 `Claude`，值为一~日单字 |
+| Codex 7d 重置星期 | `ShowCodex7dReset` | 显示 | 标签 `Codex`，值为一~日单字 |
+| 7d 重置倒计时 | `Show7dCountdown` | 显示 | 仅在 `CountdownShowBeforeHours` 阈值内显示，默认 12 小时 |
+| 新鲜度提示 | `ShowStatus` | 显示 | Claude/Codex 分别判断；1 分钟黄点，5 分钟红点 |
+| 自定义订阅日期 | `CustomSubExpiry` | `2026-08-13` | 配置用完整日期，任务栏仅显示 `8.13` |
 
 ### 圆环颜色逻辑
 
@@ -53,17 +54,18 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 
 ### 过期状态
 
-- 数据超过 15 分钟未更新时自动显示
-- 显示格式：`过期 18m` 或 `过期 2h16m`
-- 红色文字
+- Claude 和 Codex 分别记录最后成功更新时间
+- 超过 1 分钟：对应圆环显示黄色圆点，末尾显示黄色 `C过期2m` / `X过期2m`
+- 超过 5 分钟：圆点和文字变为红色
 - 保留最后一次成功数据，不清零
 - Tooltip 显示最后成功更新时间和最近错误
 
 ### 7d 重置倒计时
 
-- 自动选择最近的 7d 重置时间（Claude 或 Codex）
-- >24h：显示 `周三 14:32` 格式
-- <24h：显示 `5h30m` 倒计时格式
+- 自动选择较早的有效 7d 重置时间（Claude 或 Codex）
+- ISO 8601 时间统一按其 `Z`/时区偏移解析，再转换为 Windows 本地时间
+- 默认只在剩余 12 小时内显示，可通过 `CountdownShowBeforeHours` 调整
+- 显示 `5h30m` 倒计时格式
 - <2h：红色文字警告
 
 ### 凭据读取
@@ -106,12 +108,14 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 ShowPctSign=0          # 圆环内是否显示 %
 ShowCredits=1          # 显示 Credits 金额
 ShowReset=1            # 显示 5h 重置时间
-ShowSubscription=1     # 显示订阅状态和日期
-ShowStatus=1           # 过期时显示红色提示
-ShowClaude7dReset=0    # Claude 7d 重置星期
-ShowCodex7dReset=0     # Codex 7d 重置星期
-Show7dCountdown=0      # 7d 重置倒计时穿透显示
-CustomSubExpiry=       # 自定义订阅到期日
+ShowSubscription=0     # 隐藏 API 订阅状态
+ShowCustomExpiry=1     # 显示手动到期日期
+ShowStatus=1           # 显示分来源新鲜度圆点和文字
+ShowClaude7dReset=1    # Claude 重置星期单字
+ShowCodex7dReset=1     # Codex 重置星期单字
+Show7dCountdown=1      # 阈值内显示最近的 7d 重置倒计时
+CountdownShowBeforeHours=12
+CustomSubExpiry=2026-08-13
 ProxyServer=           # 代理地址
 RequireProxy=0         # 0=不阻止(默认), 1=无代理时阻止
 ```

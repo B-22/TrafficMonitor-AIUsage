@@ -96,6 +96,32 @@ void FormatsDisplayText() {
     AssertEqual(FormatRemainingPercent(101), L"--", "out-of-range percent text");
 }
 
+void ParsesIso8601Timestamps() {
+    const auto utc = ParseIso8601UtcSeconds("2026-07-27T08:30:45Z");
+    const auto offset = ParseIso8601UtcSeconds("2026-07-27T16:30:45.123+08:00");
+    const auto compactOffset = ParseIso8601UtcSeconds("2026-07-27T03:00:45-0530");
+    const auto equivalentUtc = ParseIso8601UtcSeconds("2026-07-27T08:30:45Z");
+
+    AssertTrue(utc.has_value(), "UTC ISO timestamp should parse");
+    AssertTrue(offset.has_value(), "offset ISO timestamp should parse");
+    AssertTrue(compactOffset.has_value(), "compact offset ISO timestamp should parse");
+    AssertEqual(static_cast<int>(*offset - *utc), 0, "offset timestamp should normalize to UTC");
+    AssertEqual(static_cast<int>(*compactOffset - *equivalentUtc), 0, "negative offset should normalize to UTC");
+    AssertTrue(!ParseIso8601UtcSeconds("2026-02-30T08:00:00Z").has_value(), "invalid date should fail");
+    AssertTrue(!ParseIso8601UtcSeconds("2026-07-27T25:00:00Z").has_value(), "invalid time should fail");
+}
+
+void ClassifiesFreshnessAndCountdownWindow() {
+    AssertTrue(ClassifyFreshness(59) == FreshnessLevel::Fresh, "59 seconds should be fresh");
+    AssertTrue(ClassifyFreshness(60) == FreshnessLevel::Warning, "one minute should warn");
+    AssertTrue(ClassifyFreshness(299) == FreshnessLevel::Warning, "under five minutes should warn");
+    AssertTrue(ClassifyFreshness(300) == FreshnessLevel::Stale, "five minutes should be stale");
+
+    AssertTrue(ShouldShowCountdown(12 * 3600, 12), "countdown should show at threshold");
+    AssertTrue(!ShouldShowCountdown(12 * 3600 + 1, 12), "countdown should hide before threshold");
+    AssertTrue(!ShouldShowCountdown(0, 12), "expired countdown should hide");
+}
+
 void BuildsMultiLineSuccessTooltip() {
     UsageSnapshot snapshot;
     snapshot.success = true;
@@ -122,6 +148,8 @@ int main() {
     ParsesUsageWindows();
     ClassifiesPrimaryWindowWithoutSecondaryWindow();
     FormatsDisplayText();
+    ParsesIso8601Timestamps();
+    ClassifiesFreshnessAndCountdownWindow();
     BuildsMultiLineSuccessTooltip();
     HasGeneratedVersion();
     return 0;
