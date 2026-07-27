@@ -116,6 +116,20 @@ void ClassifiesFreshnessAndCountdownWindow() {
     AssertTrue(ClassifyFreshness(60) == FreshnessLevel::Warning, "one minute should warn");
     AssertTrue(ClassifyFreshness(299) == FreshnessLevel::Warning, "under five minutes should warn");
     AssertTrue(ClassifyFreshness(300) == FreshnessLevel::Stale, "five minutes should be stale");
+    AssertTrue(
+        ClassifyFreshnessForDisplay(60, true) == FreshnessLevel::Fresh,
+        "in-flight refresh should suppress the one-minute boundary flash");
+    AssertTrue(
+        ClassifyFreshnessForDisplay(119, true) == FreshnessLevel::Fresh,
+        "short in-flight refresh should remain visually fresh");
+    AssertTrue(
+        ClassifyFreshnessForDisplay(120, true) == FreshnessLevel::Warning,
+        "long in-flight refresh should still warn");
+    AssertTrue(
+        ClassifyFreshnessForDisplay(60, false) == FreshnessLevel::Warning,
+        "completed failed refresh should warn immediately");
+    AssertTrue(!ShouldReplaceResetWithFreshness(600), "ten minutes should retain reset weekday");
+    AssertTrue(ShouldReplaceResetWithFreshness(601), "over ten minutes should replace reset weekday");
 
     AssertTrue(ShouldShowCountdown(12 * 3600, 12), "countdown should show at threshold");
     AssertTrue(!ShouldShowCountdown(12 * 3600 + 1, 12), "countdown should hide before threshold");

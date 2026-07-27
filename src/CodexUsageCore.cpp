@@ -204,6 +204,17 @@ FreshnessLevel ClassifyFreshness(double ageSeconds) {
     return FreshnessLevel::Fresh;
 }
 
+FreshnessLevel ClassifyFreshnessForDisplay(double ageSeconds, bool refreshInProgress) {
+    // A normal one-minute refresh briefly crosses the warning threshold while
+    // its replacement request is still in flight. Suppress only that boundary.
+    if (refreshInProgress && ageSeconds < 2 * 60) return FreshnessLevel::Fresh;
+    return ClassifyFreshness(ageSeconds);
+}
+
+bool ShouldReplaceResetWithFreshness(double ageSeconds) {
+    return ageSeconds > 10 * 60;
+}
+
 bool ShouldShowCountdown(long long secondsRemaining, int showBeforeHours) {
     if (secondsRemaining <= 0 || showBeforeHours <= 0) return false;
     return secondsRemaining <= static_cast<long long>(showBeforeHours) * 60 * 60;

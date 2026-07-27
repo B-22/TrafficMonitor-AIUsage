@@ -35,7 +35,7 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 | Claude 7d 重置星期 | `ShowClaude7dReset` | 显示 | 标签 `Claude`，值为一~日单字 |
 | Codex 7d 重置星期 | `ShowCodex7dReset` | 显示 | 标签 `Codex`，值为一~日单字 |
 | 7d 重置倒计时 | `Show7dCountdown` | 显示 | 仅在 `CountdownShowBeforeHours` 阈值内显示，默认 12 小时 |
-| 新鲜度提示 | `ShowStatus` | 显示 | Claude/Codex 分别判断；1 分钟黄点，5 分钟红点 |
+| 新鲜度提示 | `ShowStatus` | 显示 | Claude/Codex 分别判断；1 分钟黄线，5 分钟红线 |
 | 自定义订阅日期 | `CustomSubExpiry` | `2026-08-13` | 配置用完整日期，任务栏仅显示 `8.13` |
 
 ### 圆环颜色逻辑
@@ -55,8 +55,10 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 ### 过期状态
 
 - Claude 和 Codex 分别记录最后成功更新时间
-- 超过 1 分钟：对应圆环显示黄色圆点，末尾显示黄色 `C过期2m` / `X过期2m`
-- 超过 5 分钟：圆点和文字变为红色
+- 超过 1 分钟：对应圆环数字下显示黄色短横线
+- 超过 5 分钟：短横线变为红色
+- 超过 10 分钟：原有 Claude/Codex 星期值改为 `12分` 形式，超过 99 分钟固定为 `99+分`
+- 正常的一分钟刷新请求进行期间提供短暂宽限，避免边界状态闪现
 - 保留最后一次成功数据，不清零
 - Tooltip 显示最后成功更新时间和最近错误
 
@@ -110,7 +112,7 @@ ShowCredits=1          # 显示 Credits 金额
 ShowReset=1            # 显示 5h 重置时间
 ShowSubscription=0     # 隐藏 API 订阅状态
 ShowCustomExpiry=1     # 显示手动到期日期
-ShowStatus=1           # 显示分来源新鲜度圆点和文字
+ShowStatus=1           # 显示分来源新鲜度短线和过期分钟数
 ShowClaude7dReset=1    # Claude 重置星期单字
 ShowCodex7dReset=1     # Codex 重置星期单字
 Show7dCountdown=1      # 阈值内显示最近的 7d 重置倒计时

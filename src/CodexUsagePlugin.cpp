@@ -291,6 +291,16 @@ void DrawLine(Gdiplus::Graphics& g, int x, int y1, int y2, COLORREF c) {
     g.DrawLine(&p, (float)x, (float)y1, (float)x, (float)y2);
 }
 
+void DrawFreshnessUnderline(Gdiplus::Graphics& g, int centerX, int y, COLORREF c, int dpi) {
+    const int halfWidth = std::max(3, static_cast<int>(roundf(4.0f * dpi / 96.0f)));
+    const float stroke = std::max(1.0f, 1.5f * dpi / 96.0f);
+    Gdiplus::Pen p(ToGdiColor(c), stroke);
+    p.SetStartCap(Gdiplus::LineCapRound);
+    p.SetEndCap(Gdiplus::LineCapRound);
+    g.DrawLine(&p, static_cast<float>(centerX - halfWidth), static_cast<float>(y),
+               static_cast<float>(centerX + halfWidth), static_cast<float>(y));
+}
+
 void DrawDot(Gdiplus::Graphics& g, int x, int y, int r, COLORREF c) {
     Gdiplus::SolidBrush b(Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)));
     g.FillEllipse(&b, x - r, y - r, r * 2, r * 2);
@@ -329,6 +339,7 @@ struct DashData {
     double lastCodexOk = 0;
     bool claudeAvailable = false;
     bool codexAvailable = false;
+    bool refreshInProgress = false;
 };
 
 std::wstring FormatCredits(const DashData& data) {
@@ -357,11 +368,27 @@ double SourceAge(bool available, double lastSuccess) {
     return std::max(0.0, static_cast<double>(time(nullptr)) - lastSuccess);
 }
 
-COLORREF FreshnessDotColor(bool available, double lastSuccess) {
-    const FreshnessLevel level = ClassifyFreshness(SourceAge(available, lastSuccess));
+FreshnessLevel DisplayFreshness(bool available, double lastSuccess, bool refreshInProgress) {
+    return ClassifyFreshnessForDisplay(
+        SourceAge(available, lastSuccess), refreshInProgress);
+}
+
+COLORREF FreshnessMarkerColor(bool available, double lastSuccess, bool refreshInProgress) {
+    const FreshnessLevel level = DisplayFreshness(available, lastSuccess, refreshInProgress);
     if (level == FreshnessLevel::Warning) return DOT_YELLOW;
     if (level == FreshnessLevel::Stale) return DOT_RED;
     return 0;
+}
+
+std::wstring FormatFreshnessMinutes(bool available, double lastSuccess, bool refreshInProgress) {
+    const double ageSeconds = SourceAge(available, lastSuccess);
+    if (DisplayFreshness(available, lastSuccess, refreshInProgress) == FreshnessLevel::Fresh
+        || !ShouldReplaceResetWithFreshness(ageSeconds)) {
+        return {};
+    }
+    const int minutes = std::max(1, static_cast<int>(ageSeconds / 60));
+    if (minutes > 99) return L"99+\u5206";
+    return std::to_wstring(minutes) + L"\u5206";
 }
 
 std::wstring FormatSourceAge(const wchar_t* source, double ageSeconds) {
@@ -386,16 +413,6 @@ std::wstring BuildFreshnessText(const DashData& data) {
     return claude + L" " + codex;
 }
 
-COLORREF OverallFreshnessColor(const DashData& data) {
-    const FreshnessLevel claude = ClassifyFreshness(
-        SourceAge(data.claudeAvailable, data.lastClaudeOk));
-    const FreshnessLevel codex = ClassifyFreshness(
-        SourceAge(data.codexAvailable, data.lastCodexOk));
-    if (claude == FreshnessLevel::Stale || codex == FreshnessLevel::Stale) return DOT_RED;
-    if (claude == FreshnessLevel::Warning || codex == FreshnessLevel::Warning) return DOT_YELLOW;
-    return 0;
-}
-
 // =====================================================================
 // Main custom-drawn item
 // =====================================================================
@@ -414,18 +431,23 @@ public:
         // Fallback for hosts that do not call GetItemWidthEx. This estimate is
         // based on enabled blocks instead of a fixed width that clips the tail.
         int width = 132;
-        if (opts_.showCredits) width += 45;
-        if (opts_.showReset) width += 48;
-        if (opts_.showSubscription) width += 55;
-        if (opts_.showCustomExpiry) width += 45;
-        if (opts_.showClaude7dReset) width += 45;
-        if (opts_.showCodex7dReset) width += 45;
+        bool hasInfoBlock = false;
+        const auto addEstimatedBlock = [&](int blockWidth) {
+            width += blockWidth;
+            hasInfoBlock = true;
+        };
+        if (opts_.showCredits) addEstimatedBlock(45);
+        if (opts_.showReset) addEstimatedBlock(48);
+        if (opts_.showSubscription) addEstimatedBlock(55);
+        if (opts_.showCustomExpiry) addEstimatedBlock(45);
+        if (opts_.showClaude7dReset) addEstimatedBlock(45);
+        if (opts_.showCodex7dReset) addEstimatedBlock(45);
         if (opts_.show7dCountdown
             && Format7dCountdown(data_.c7Reset, data_.x7ResetUnix,
                                  opts_.countdownShowBeforeHours).first != L"--") {
-            width += 55;
+            addEstimatedBlock(55);
         }
-        if (opts_.showStatus && !BuildFreshnessText(data_).empty()) width += 90;
+        if (hasInfoBlock) width -= 12;
         return width;
     }
 
@@ -446,10 +468,12 @@ public:
         Gdiplus::Graphics g(hdc);
         const wchar_t* ff = L"Segoe UI";
         int width = m.padX + 3 * (m.ringD + m.ringGap) + 2 * m.sepMargin;
+        bool hasInfoBlock = false;
         const auto addBlock = [&](const wchar_t* label, const std::wstring& value, int valueExtra = 0) {
             width += std::max(TextWidth(g, label, ff, (float)m.infoLabelSize, false),
                               TextWidth(g, value.c_str(), ff, (float)m.infoValueSize, true) + valueExtra)
                    + m.infoGap;
+            hasInfoBlock = true;
         };
         if (opts.showCredits) addBlock(L"Credits", FormatCredits(snap));
         if (opts.showReset) {
@@ -466,19 +490,27 @@ public:
             addBlock(L"\u5230\u671F", IsoToCompactDateW(opts.customSubExpiry));
         }
         if (opts.showClaude7dReset) {
-            addBlock(L"Claude", snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset));
+            std::wstring value = opts.showStatus
+                ? FormatFreshnessMinutes(
+                    snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress)
+                : L"";
+            if (value.empty()) value = snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset);
+            addBlock(L"Claude", value);
         }
-        if (opts.showCodex7dReset) addBlock(L"Codex", UnixToWeekday(snap.x7ResetUnix));
+        if (opts.showCodex7dReset) {
+            std::wstring value = opts.showStatus
+                ? FormatFreshnessMinutes(
+                    snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress)
+                : L"";
+            if (value.empty()) value = UnixToWeekday(snap.x7ResetUnix);
+            addBlock(L"Codex", value);
+        }
         if (opts.show7dCountdown) {
             auto [value, urgent] = Format7dCountdown(
                 snap.c7Reset, snap.x7ResetUnix, opts.countdownShowBeforeHours);
             if (value != L"--") addBlock(L"7d\u91CD\u7F6E", value);
         }
-        const std::wstring freshnessText = BuildFreshnessText(snap);
-        if (opts.showStatus && !freshnessText.empty()) {
-            width += 2 * m.sepMargin;
-            width += TextWidth(g, freshnessText.c_str(), ff, (float)m.staleSize, true);
-        }
+        if (hasInfoBlock) width -= m.infoGap;
         width += m.padX;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -517,7 +549,7 @@ public:
         Gdiplus::Color cValue = ToGdiColor(TEXT_VALUE);
 
         // ── Ring gauges ──
-        auto ring = [&](int pct, COLORREF clr, const wchar_t* tag, COLORREF statusDot = 0) {
+        auto ring = [&](int pct, COLORREF clr, const wchar_t* tag, COLORREF freshnessMarker = 0) {
             int rcx = curX + m.ringD / 2;
             int R = m.ringD / 2 - m.ringStroke;
             DrawArc(g, rcx, cy, R, m.ringStroke, std::max(0, pct), RING_TRACK,
@@ -540,20 +572,20 @@ public:
             float ly = (float)(cy - m.ringD / 2 + m.labelOffsetY);
             DrawTextAt(g, tag, lx, ly, ff, (float)m.labelSize,
                        Gdiplus::Color(178, 178, 178), true);
-            if (opts.showStatus && statusDot != 0) {
-                const int badgeR = std::max(2, m.dotSize / 2);
-                DrawDot(g, curX + m.ringD - badgeR, cy + m.ringD / 2 - badgeR,
-                        badgeR, statusDot);
+            if (opts.showStatus && freshnessMarker != 0) {
+                DrawFreshnessUnderline(
+                    g, rcx, cy + m.pctNumSize / 2 + std::max(2, dpi / 48),
+                    freshnessMarker, dpi);
             }
             curX += m.ringD + m.ringGap;
         };
 
-        const COLORREF claudeFreshness = FreshnessDotColor(
-            snap.claudeAvailable, snap.lastClaudeOk);
-        const COLORREF codexFreshness = FreshnessDotColor(
-            snap.codexAvailable, snap.lastCodexOk);
+        const COLORREF claudeFreshness = FreshnessMarkerColor(
+            snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress);
+        const COLORREF codexFreshness = FreshnessMarkerColor(
+            snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress);
         ring(snap.c5, GaugeColor(snap.c5, true), L"5h", claudeFreshness);
-        ring(snap.c7, GaugeColor(snap.c7, true), L"7d");
+        ring(snap.c7, GaugeColor(snap.c7, true), L"7d", claudeFreshness);
         ring(snap.x7, GaugeColor(snap.x7, false), L"7d", codexFreshness);
 
         // ── Separator 1 ──
@@ -623,11 +655,19 @@ public:
 
         // ── 7d reset weekday blocks ──
         if (opts.showClaude7dReset) {
-            std::wstring wd = snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset);
+            std::wstring wd = opts.showStatus
+                ? FormatFreshnessMinutes(
+                    snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress)
+                : L"";
+            if (wd.empty()) wd = snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset);
             block(L"Claude", wd.c_str());
         }
         if (opts.showCodex7dReset) {
-            std::wstring wd = UnixToWeekday(snap.x7ResetUnix);
+            std::wstring wd = opts.showStatus
+                ? FormatFreshnessMinutes(
+                    snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress)
+                : L"";
+            if (wd.empty()) wd = UnixToWeekday(snap.x7ResetUnix);
             block(L"Codex", wd.c_str());
         }
 
@@ -651,17 +691,6 @@ public:
         }
 
         // ── Separator 2 + per-source freshness status ──
-        const std::wstring freshnessText = BuildFreshnessText(snap);
-        if (opts.showStatus && !freshnessText.empty()) {
-            curX += m.sepMargin;
-            DrawLine(g, curX, cy - m.sepH / 2, cy + m.sepH / 2, SEP_COLOR);
-            curX += m.sepMargin;
-            const COLORREF freshnessColor = OverallFreshnessColor(snap);
-            DrawTextAt(g, freshnessText.c_str(), (float)curX, (float)(cy - m.staleSize / 2),
-                       ff, (float)m.staleSize, ToGdiColor(freshnessColor), true);
-            curX += TextWidth(g, freshnessText.c_str(), ff, (float)m.staleSize, true);
-        }
-
         if (savedDc != 0) RestoreDC(hdc, savedDc);
     }
 
@@ -703,6 +732,11 @@ public:
             busy_ = true;
             lastFetch_ = now;
         }
+        {
+            DashData refreshing = dash_.GetSnapshot();
+            refreshing.refreshInProgress = true;
+            dash_.SetSnapshot(refreshing);
+        }
         std::thread([this]() {
             auto claude = claude_.Fetch();
             auto codex = codex_.Fetch();
@@ -726,6 +760,7 @@ public:
                 d.codexAvailable = true;
                 d.lastCodexOk = t;
             }
+            d.refreshInProgress = false;
             dash_.SetSnapshot(d);
             std::lock_guard<std::mutex> lk(mu_);
             tip_ = BuildTip(claude, codex);

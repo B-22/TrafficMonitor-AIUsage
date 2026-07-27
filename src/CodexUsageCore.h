@@ -30,6 +30,8 @@ std::wstring Utf8ToWide(const std::string& input);
 UsageSnapshot ParseUsageJson(const std::string& jsonText, std::wstring* errorMessage);
 std::optional<long long> ParseIso8601UtcSeconds(const std::string& text);
 FreshnessLevel ClassifyFreshness(double ageSeconds);
+FreshnessLevel ClassifyFreshnessForDisplay(double ageSeconds, bool refreshInProgress);
+bool ShouldReplaceResetWithFreshness(double ageSeconds);
 bool ShouldShowCountdown(long long secondsRemaining, int showBeforeHours);
 std::wstring FormatRemainingPercent(int remainingPercent);
 std::wstring FormatResetAfter(int seconds);
