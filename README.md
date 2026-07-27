@@ -2,6 +2,8 @@
 
 TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude 和 Codex 的用量、Credits、订阅状态。
 
+信息块按各自最大文字宽度排版，上下标签与数值水平居中，并作为整体垂直居中。
+
 ![Preview](docs/design/preview_final.png)
 
 ## 功能完整列表

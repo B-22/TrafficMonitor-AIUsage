@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-set(CODEX_USAGE_VERSION "0.4.1" CACHE STRING "AIUsage plugin version")
+set(CODEX_USAGE_VERSION "0.4.2" CACHE STRING "AIUsage plugin version")
 
 project(AIUsage VERSION "${CODEX_USAGE_VERSION}" LANGUAGES CXX)
 

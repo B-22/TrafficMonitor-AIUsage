@@ -596,17 +596,23 @@ public:
         // ── Info blocks ──
         auto block = [&](const wchar_t* label, const wchar_t* value,
                          const wchar_t* sub = nullptr, COLORREF subClr = TEXT_LABEL) {
-            int by = cy - h / 2 + m.infoPadTop;
-            DrawTextAt(g, label, (float)curX, (float)by, ff, (float)m.infoLabelSize, cLabel, false);
-            DrawTextAt(g, value, (float)curX, (float)(by + m.infoLabelSize + 3), ff,
-                       (float)m.infoValueSize, cValue, true);
+            const int labelW = TextWidth(g, label, ff, (float)m.infoLabelSize, false);
+            const int valueW = TextWidth(g, value, ff, (float)m.infoValueSize, true);
+            const int subW = sub ? TextWidth(g, sub, ff, (float)m.infoSubSize, false) : 0;
+            const int bw = std::max({labelW, valueW, subW});
+            const int totalH = m.infoLabelSize + 3 + m.infoValueSize
+                             + (sub ? 2 + m.infoSubSize : 0);
+            const int by = cy - totalH / 2;
+            const int valueY = by + m.infoLabelSize + 3;
+            DrawTextAt(g, label, (float)(curX + (bw - labelW) / 2), (float)by,
+                       ff, (float)m.infoLabelSize, cLabel, false);
+            DrawTextAt(g, value, (float)(curX + (bw - valueW) / 2), (float)valueY,
+                       ff, (float)m.infoValueSize, cValue, true);
             if (sub) {
-                DrawTextAt(g, sub, (float)curX, (float)(by + m.infoLabelSize + m.infoValueSize + 5),
+                DrawTextAt(g, sub, (float)(curX + (bw - subW) / 2),
+                           (float)(valueY + m.infoValueSize + 2),
                            ff, (float)m.infoSubSize, Gdiplus::Color(GetRValue(subClr), GetGValue(subClr), GetBValue(subClr)), false);
             }
-            int bw = std::max(TextWidth(g, value, ff, (float)m.infoValueSize, true),
-                              TextWidth(g, label, ff, (float)m.infoLabelSize, false));
-            if (sub) bw = std::max(bw, TextWidth(g, sub, ff, (float)m.infoSubSize, false));
             curX += bw + m.infoGap;
         };
 
@@ -629,12 +635,18 @@ public:
             COLORREF dotClr = 0;
             if (isCanceled) { dotClr = DOT_RED; }
             else if (isActive) { dotClr = DOT_GREEN; }
-            // We draw the dot separately
-            int by = cy - h / 2 + m.infoPadTop;
-            DrawTextAt(g, L"\u8BA2\u9605", (float)curX, (float)by, ff,
+            const int labelW = TextWidth(
+                g, L"\u8BA2\u9605", ff, (float)m.infoLabelSize, false);
+            const int valueTextW = TextWidth(
+                g, dateStr.c_str(), ff, (float)m.infoValueSize, true);
+            const int valueW = valueTextW + (dotClr ? m.dotSize + m.dotGap : 0);
+            const int bw = std::max(labelW, valueW);
+            const int totalH = m.infoLabelSize + 3 + m.infoValueSize;
+            const int by = cy - totalH / 2;
+            DrawTextAt(g, L"\u8BA2\u9605", (float)(curX + (bw - labelW) / 2), (float)by, ff,
                        (float)m.infoLabelSize, cLabel, false);
             // Value with dot
-            int vx = curX;
+            int vx = curX + (bw - valueW) / 2;
             int vy = by + m.infoLabelSize + 3;
             if (dotClr) {
                 DrawDot(g, vx + m.dotSize / 2, vy + m.infoValueSize / 2, m.dotSize / 2, dotClr);
@@ -642,9 +654,6 @@ public:
             }
             DrawTextAt(g, dateStr.c_str(), (float)vx, (float)vy, ff,
                        (float)m.infoValueSize, cValue, true);
-            int bw = TextWidth(g, dateStr.c_str(), ff, (float)m.infoValueSize, true)
-                   + (dotClr ? m.dotSize + m.dotGap : 0);
-            bw = std::max(bw, TextWidth(g, L"\u8BA2\u9605", ff, (float)m.infoLabelSize, false));
             curX += bw + m.infoGap;
         }
 
@@ -679,13 +688,18 @@ public:
                 Gdiplus::Color valColor = urgent
                     ? ToGdiColor(STALE_CLR)  // red when < 2h
                     : cValue;
-                int by = cy - h / 2 + m.infoPadTop;
-                DrawTextAt(g, L"7d\u91CD\u7F6E", (float)curX, (float)by, ff,
+                const int labelW = TextWidth(
+                    g, L"7d\u91CD\u7F6E", ff, (float)m.infoLabelSize, false);
+                const int valueW = TextWidth(
+                    g, countdown.c_str(), ff, (float)m.infoValueSize, true);
+                const int bw = std::max(labelW, valueW);
+                const int totalH = m.infoLabelSize + 3 + m.infoValueSize;
+                const int by = cy - totalH / 2;
+                DrawTextAt(g, L"7d\u91CD\u7F6E", (float)(curX + (bw - labelW) / 2), (float)by, ff,
                            (float)m.infoLabelSize, cLabel, false);
-                DrawTextAt(g, countdown.c_str(), (float)curX, (float)(by + m.infoLabelSize + 3),
+                DrawTextAt(g, countdown.c_str(), (float)(curX + (bw - valueW) / 2),
+                           (float)(by + m.infoLabelSize + 3),
                            ff, (float)m.infoValueSize, valColor, true);
-                int bw = std::max(TextWidth(g, countdown.c_str(), ff, (float)m.infoValueSize, true),
-                                  TextWidth(g, L"7d\u91CD\u7F6E", ff, (float)m.infoLabelSize, false));
                 curX += bw + m.infoGap;
             }
         }
