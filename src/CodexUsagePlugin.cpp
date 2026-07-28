@@ -430,11 +430,9 @@ public:
         PluginOptions opts;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            if (cachedW_ > 0) return cachedW_;
             opts = opts_;
         }
-        // Width depends only on enabled blocks, never on refresh state. This
-        // prevents TrafficMonitor from persisting a newly shifted taskbar
-        // anchor every time cold-start placeholders are replaced by live data.
         int width = 124;
         bool hasInfoBlock = false;
         const auto addEstimatedBlock = [&](int blockWidth) {
@@ -461,9 +459,11 @@ public:
         int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
         if (dpi < 72) dpi = 96;
         const LM m = GetMetrics(dpi);
+        DashData snap;
         PluginOptions opts;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            snap = data_;
             opts = opts_;
         }
 
@@ -477,21 +477,55 @@ public:
                    + m.infoGap;
             hasInfoBlock = true;
         };
-        // Maximum representative values keep the width stable before and
-        // after refresh while still fitting every compact display state.
-        if (opts.showCredits) addBlock(L"Credits", L"$999.99");
-        if (opts.showReset) addBlock(L"5h\u91CD\u7F6E", L"23:59");
-        if (opts.showSubscription) {
-            addBlock(L"\u8BA2\u9605", L"\u5DF2\u53D6\u6D88",
-                     m.dotSize + m.dotGap);
+        if (opts.showCredits) addBlock(L"Credits", FormatCredits(snap));
+        if (opts.showReset) {
+            addBlock(L"5h\u91CD\u7F6E",
+                     snap.c5Reset.empty() ? L"--" : IsoToLocalTimeW(snap.c5Reset));
         }
-        if (opts.showCustomExpiry) addBlock(L"\u5230\u671F", L"12.31");
-        const wchar_t* resetSample = opts.show7dCountdown
-            ? L"23h59m" : L"99+\u5206";
-        if (opts.showClaude7dReset) addBlock(L"Claude", resetSample);
-        if (opts.showCodex7dReset) addBlock(L"Codex", resetSample);
+        if (opts.showSubscription) {
+            const bool hasStatusDot = snap.subStatus == "active"
+                || snap.subStatus == "trialing" || snap.subStatus == "canceled"
+                || snap.subStatus == "past_due" || snap.subStatus == "paused";
+            addBlock(L"\u8BA2\u9605", FormatSubscriptionStatus(snap),
+                     hasStatusDot ? m.dotSize + m.dotGap : 0);
+        }
+        if (opts.showCustomExpiry) {
+            addBlock(L"\u5230\u671F", IsoToCompactDateW(opts.customSubExpiry));
+        }
+        if (opts.showClaude7dReset) {
+            std::wstring value;
+            if (opts.show7dCountdown) {
+                value = Format7dCountdown(
+                    snap.c7Reset, 0, opts.countdownShowBeforeHours);
+            }
+            if (value.empty() && opts.showStatus) {
+                value = FormatFreshnessMinutes(
+                    snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress);
+            }
+            if (value.empty()) {
+                value = snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset);
+            }
+            addBlock(L"Claude", value);
+        }
+        if (opts.showCodex7dReset) {
+            std::wstring value;
+            if (opts.show7dCountdown) {
+                value = Format7dCountdown(
+                    {}, snap.x7ResetUnix, opts.countdownShowBeforeHours);
+            }
+            if (value.empty() && opts.showStatus) {
+                value = FormatFreshnessMinutes(
+                    snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress);
+            }
+            if (value.empty()) value = UnixToWeekday(snap.x7ResetUnix);
+            addBlock(L"Codex", value);
+        }
         if (hasInfoBlock) width -= m.infoGap;
         width += m.padRight;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            cachedW_ = width;
+        }
         return width;
     }
 
@@ -673,10 +707,12 @@ public:
     void SetSnapshot(const DashData& d) {
         std::lock_guard<std::mutex> lk(mu_);
         data_ = d;
+        cachedW_ = 0;
     }
     void SetOptions(const PluginOptions& o) {
         std::lock_guard<std::mutex> lk(mu_);
         opts_ = o;
+        cachedW_ = 0;
     }
     PluginOptions GetOptions() const { std::lock_guard<std::mutex> lk(mu_); return opts_; }
     DashData GetSnapshot() const { std::lock_guard<std::mutex> lk(mu_); return data_; }
@@ -685,6 +721,7 @@ private:
     mutable std::mutex mu_;
     DashData data_;
     PluginOptions opts_;
+    mutable int cachedW_ = 0;
 };
 
 // =====================================================================
@@ -902,7 +939,23 @@ public:
     }
 
 private:
-    AIUsagePlugin() = default;
+    AIUsagePlugin() {
+        // Some TrafficMonitor builds do not send EI_CONFIG_DIR to plugins.
+        // Fall back to the directory of the running host executable so local
+        // display and proxy-safety settings are always loaded.
+        std::array<wchar_t, 32768> executablePath{};
+        const DWORD length = GetModuleFileNameW(
+            nullptr, executablePath.data(),
+            static_cast<DWORD>(executablePath.size()));
+        if (length > 0 && length < executablePath.size()) {
+            std::wstring path(executablePath.data(), length);
+            const size_t slash = path.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                configDir_ = path.substr(0, slash);
+                LoadConfig();
+            }
+        }
+    }
 
     void LoadConfig() {
         if (configDir_.empty()) return;

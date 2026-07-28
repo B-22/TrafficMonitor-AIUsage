@@ -2,10 +2,9 @@
 
 TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude 和 Codex 的用量、Credits、订阅状态。
 
-信息块按各自最大文字宽度排版，上下标签与数值水平居中，并相对圆环整体上移
-2 个逻辑像素。插件宽度只由显示开关决定，不随冷启动占位符、刷新结果或倒计时
-状态改变；右侧仅保留 2 个逻辑像素内边距，避免 TrafficMonitor 重启后反复保存
-偏移或在托盘前留下额外空白。
+信息块按实际标签和数值宽度排版，上下标签与数值水平居中，并相对圆环整体上移
+2 个逻辑像素。宽度测量与实际绘制使用同一组当前文字，不再按最大示例值预留后
+又把差值累积到最右端；右侧仅保留 2 个逻辑像素内边距。
 
 ![Preview](docs/design/preview_final.png)
 
@@ -137,6 +136,10 @@ VerifyTargetHostExitIp=1
 - Token 刷新沿用参考项目的安全写入方式
 
 ## 插件选项（AIUsage.ini）
+
+插件优先使用 TrafficMonitor 通过 `EI_CONFIG_DIR` 提供的配置目录；若宿主版本未
+发送该回调，则自动从当前 `TrafficMonitor.exe` 所在目录读取 `AIUsage.ini`。
+因此显示选项与出口 IP 锁不会因为宿主接口差异而静默退回默认值。
 
 ```ini
 [AIUsage]
