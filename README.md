@@ -179,6 +179,11 @@ ctest --test-dir build -C Release --output-on-failure
 4. 启动 TrafficMonitor
 5. 在显示设置中启用 "AI Usage Dashboard"
 
+部署时不能只发送一次结束命令就立即重启：必须确认所有 `TrafficMonitor.exe`
+实例已经退出、进程数为 0，再启动一次并确认进程数为 1。残留实例会继续加载旧
+DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本地可使用
+`deploy-local.ps1` 执行这一严格流程；脚本不会覆盖本机 `AIUsage.ini`。
+
 ## 文件结构
 
 ```
