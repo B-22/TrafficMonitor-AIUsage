@@ -190,6 +190,7 @@ DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本�
 ├── CMakeLists.txt
 ├── AGENTS.md                      # 协作、README 同步及隐私规范
 ├── AIUsage.ini                    # 配置模板
+├── deploy-local.ps1               # 零残留、单实例本地部署
 ├── LICENSE
 ├── README.md
 ├── gemini_bridge.user.js          # Gemini 用量监控脚本
