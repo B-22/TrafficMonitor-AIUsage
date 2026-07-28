@@ -41,9 +41,10 @@ std::optional<std::string> HttpGetJson(const ProxyConfig& proxyConfig,
         errorMessage->clear();
     }
 
-    HINTERNET session = OpenHttpSession(proxyConfig, userAgent.c_str());
+    HINTERNET session = OpenHttpSession(
+        proxyConfig, userAgent.c_str(), host.c_str(), errorMessage);
     if (session == nullptr) {
-        if (errorMessage != nullptr) {
+        if (errorMessage != nullptr && errorMessage->empty()) {
             *errorMessage = L"WinHttpOpen failed";
         }
         return std::nullopt;

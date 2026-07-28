@@ -92,8 +92,14 @@ std::optional<std::string> ClaudeUsageFetcher::HttpGet(
     std::wstring whost(host.begin(), host.end());
     std::wstring wpath(path.begin(), path.end());
 
-    HINTERNET session = OpenHttpSession(proxyConfig_, L"ClaudeUsageFetcher/1.0");
-    if (!session) { if (errorMessage) *errorMessage = L"WinHttpOpen failed"; return std::nullopt; }
+    HINTERNET session = OpenHttpSession(
+        proxyConfig_, L"ClaudeUsageFetcher/1.0", whost.c_str(), errorMessage);
+    if (!session) {
+        if (errorMessage && errorMessage->empty()) {
+            *errorMessage = L"WinHttpOpen failed";
+        }
+        return std::nullopt;
+    }
 
     std::optional<std::string> result;
     HINTERNET connect = nullptr, request = nullptr;
@@ -199,7 +205,8 @@ std::optional<std::string> ClaudeUsageFetcher::RefreshCliToken(const std::string
         std::wstring whost(host, host + strlen(host));
         std::wstring wpath(path, path + strlen(path));
 
-        HINTERNET session = OpenHttpSession(proxyConfig_, L"ClaudeUsageFetcher/1.0");
+        HINTERNET session = OpenHttpSession(
+            proxyConfig_, L"ClaudeUsageFetcher/1.0", whost.c_str());
         if (!session) continue;
 
         HINTERNET connect = WinHttpConnect(session, whost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -361,7 +368,9 @@ ClaudeUsageData ClaudeUsageFetcher::Fetch() {
 
     if (statusCode != 200 || !response) {
         ClaudeUsageData err;
-        err.errorMessage = L"HTTP " + std::to_wstring(statusCode);
+        err.errorMessage = !wError.empty()
+            ? wError
+            : L"HTTP " + std::to_wstring(statusCode);
         if (cachedData_.success) {
             ClaudeUsageData stale = cachedData_;
             stale.errorMessage = err.errorMessage;

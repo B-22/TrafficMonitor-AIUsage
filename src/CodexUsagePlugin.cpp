@@ -43,6 +43,7 @@ struct LM {
     int sepH;            // 20px
     int sepMargin;       // 8px each side
     int infoGap;         // 12px
+    int infoYOffset;     // -2px
     int infoPadTop;      // 4px
     int infoLabelSize;   // 7px
     int infoValueSize;   // 9.5px → 10px
@@ -71,6 +72,7 @@ LM GetMetrics(int dpi) {
     m.sepH          = (int)(20 * s);
     m.sepMargin     = (int)(8 * s);
     m.infoGap       = (int)(12 * s);
+    m.infoYOffset   = (int)roundf(-2.0f * s);
     m.infoPadTop    = (int)(4 * s);
     m.infoLabelSize = std::max(6, (int)(7 * s));
     m.infoValueSize = std::max(8, (int)roundf(9.5f * s));
@@ -314,13 +316,13 @@ struct PluginOptions {
     bool showCredits = true;
     bool showReset = true;
     bool showSubscription = false;
-    bool showCustomExpiry = true;
+    bool showCustomExpiry = false;
     bool showStatus = true;
     bool showClaude7dReset = true;  // show Claude 7d reset weekday
     bool showCodex7dReset = true;   // show Codex 7d reset weekday
     bool show7dCountdown = true;    // show the nearest 7d reset
     int countdownShowBeforeHours = 12;
-    std::string customSubExpiry = "2026-08-13";
+    std::string customSubExpiry;
 };
 
 // =====================================================================
@@ -426,27 +428,27 @@ public:
     bool IsCustomDraw() const override { return true; }
 
     int GetItemWidth() const override {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (cachedW_ > 0) return cachedW_;
-        // Fallback for hosts that do not call GetItemWidthEx. This estimate is
-        // based on enabled blocks instead of a fixed width that clips the tail.
+        PluginOptions opts;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            opts = opts_;
+        }
+        // Width depends only on enabled blocks, never on refresh state. This
+        // prevents TrafficMonitor from persisting a newly shifted taskbar
+        // anchor every time cold-start placeholders are replaced by live data.
         int width = 132;
         bool hasInfoBlock = false;
         const auto addEstimatedBlock = [&](int blockWidth) {
             width += blockWidth;
             hasInfoBlock = true;
         };
-        if (opts_.showCredits) addEstimatedBlock(45);
-        if (opts_.showReset) addEstimatedBlock(48);
-        if (opts_.showSubscription) addEstimatedBlock(55);
-        if (opts_.showCustomExpiry) addEstimatedBlock(45);
-        if (opts_.showClaude7dReset) addEstimatedBlock(45);
-        if (opts_.showCodex7dReset) addEstimatedBlock(45);
-        if (opts_.show7dCountdown
-            && Format7dCountdown(data_.c7Reset, data_.x7ResetUnix,
-                                 opts_.countdownShowBeforeHours).first != L"--") {
-            addEstimatedBlock(55);
-        }
+        if (opts.showCredits) addEstimatedBlock(55);
+        if (opts.showReset) addEstimatedBlock(48);
+        if (opts.showSubscription) addEstimatedBlock(55);
+        if (opts.showCustomExpiry) addEstimatedBlock(45);
+        if (opts.showClaude7dReset) addEstimatedBlock(45);
+        if (opts.showCodex7dReset) addEstimatedBlock(45);
+        if (opts.show7dCountdown) addEstimatedBlock(55);
         if (hasInfoBlock) width -= 12;
         return width;
     }
@@ -457,11 +459,9 @@ public:
         int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
         if (dpi < 72) dpi = 96;
         const LM m = GetMetrics(dpi);
-        DashData snap;
         PluginOptions opts;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            snap = data_;
             opts = opts_;
         }
 
@@ -475,47 +475,20 @@ public:
                    + m.infoGap;
             hasInfoBlock = true;
         };
-        if (opts.showCredits) addBlock(L"Credits", FormatCredits(snap));
-        if (opts.showReset) {
-            addBlock(L"5h\u91CD\u7F6E", snap.c5Reset.empty() ? L"--" : IsoToLocalTimeW(snap.c5Reset));
-        }
+        // Maximum representative values keep the width stable before and
+        // after refresh while still fitting every compact display state.
+        if (opts.showCredits) addBlock(L"Credits", L"$999.99");
+        if (opts.showReset) addBlock(L"5h\u91CD\u7F6E", L"23:59");
         if (opts.showSubscription) {
-            const bool hasStatusDot = snap.subStatus == "active" || snap.subStatus == "trialing"
-                || snap.subStatus == "canceled" || snap.subStatus == "past_due"
-                || snap.subStatus == "paused";
-            addBlock(L"\u8BA2\u9605", FormatSubscriptionStatus(snap),
-                     hasStatusDot ? m.dotSize + m.dotGap : 0);
+            addBlock(L"\u8BA2\u9605", L"\u5DF2\u53D6\u6D88",
+                     m.dotSize + m.dotGap);
         }
-        if (opts.showCustomExpiry) {
-            addBlock(L"\u5230\u671F", IsoToCompactDateW(opts.customSubExpiry));
-        }
-        if (opts.showClaude7dReset) {
-            std::wstring value = opts.showStatus
-                ? FormatFreshnessMinutes(
-                    snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress)
-                : L"";
-            if (value.empty()) value = snap.c7Reset.empty() ? L"--" : IsoToWeekday(snap.c7Reset);
-            addBlock(L"Claude", value);
-        }
-        if (opts.showCodex7dReset) {
-            std::wstring value = opts.showStatus
-                ? FormatFreshnessMinutes(
-                    snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress)
-                : L"";
-            if (value.empty()) value = UnixToWeekday(snap.x7ResetUnix);
-            addBlock(L"Codex", value);
-        }
-        if (opts.show7dCountdown) {
-            auto [value, urgent] = Format7dCountdown(
-                snap.c7Reset, snap.x7ResetUnix, opts.countdownShowBeforeHours);
-            if (value != L"--") addBlock(L"7d\u91CD\u7F6E", value);
-        }
+        if (opts.showCustomExpiry) addBlock(L"\u5230\u671F", L"12.31");
+        if (opts.showClaude7dReset) addBlock(L"Claude", L"99+\u5206");
+        if (opts.showCodex7dReset) addBlock(L"Codex", L"99+\u5206");
+        if (opts.show7dCountdown) addBlock(L"7d\u91CD\u7F6E", L"23h59m");
         if (hasInfoBlock) width -= m.infoGap;
         width += m.padX;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            cachedW_ = width;
-        }
         return width;
     }
 
@@ -602,7 +575,7 @@ public:
             const int bw = std::max({labelW, valueW, subW});
             const int totalH = m.infoLabelSize + 3 + m.infoValueSize
                              + (sub ? 2 + m.infoSubSize : 0);
-            const int by = cy - totalH / 2;
+            const int by = cy - totalH / 2 + m.infoYOffset;
             const int valueY = by + m.infoLabelSize + 3;
             DrawTextAt(g, label, (float)(curX + (bw - labelW) / 2), (float)by,
                        ff, (float)m.infoLabelSize, cLabel, false);
@@ -642,7 +615,7 @@ public:
             const int valueW = valueTextW + (dotClr ? m.dotSize + m.dotGap : 0);
             const int bw = std::max(labelW, valueW);
             const int totalH = m.infoLabelSize + 3 + m.infoValueSize;
-            const int by = cy - totalH / 2;
+            const int by = cy - totalH / 2 + m.infoYOffset;
             DrawTextAt(g, L"\u8BA2\u9605", (float)(curX + (bw - labelW) / 2), (float)by, ff,
                        (float)m.infoLabelSize, cLabel, false);
             // Value with dot
@@ -684,24 +657,22 @@ public:
         if (opts.show7dCountdown) {
             auto [countdown, urgent] = Format7dCountdown(
                 snap.c7Reset, snap.x7ResetUnix, opts.countdownShowBeforeHours);
-            if (countdown != L"--") {
-                Gdiplus::Color valColor = urgent
-                    ? ToGdiColor(STALE_CLR)  // red when < 2h
-                    : cValue;
-                const int labelW = TextWidth(
-                    g, L"7d\u91CD\u7F6E", ff, (float)m.infoLabelSize, false);
-                const int valueW = TextWidth(
-                    g, countdown.c_str(), ff, (float)m.infoValueSize, true);
-                const int bw = std::max(labelW, valueW);
-                const int totalH = m.infoLabelSize + 3 + m.infoValueSize;
-                const int by = cy - totalH / 2;
-                DrawTextAt(g, L"7d\u91CD\u7F6E", (float)(curX + (bw - labelW) / 2), (float)by, ff,
-                           (float)m.infoLabelSize, cLabel, false);
-                DrawTextAt(g, countdown.c_str(), (float)(curX + (bw - valueW) / 2),
-                           (float)(by + m.infoLabelSize + 3),
-                           ff, (float)m.infoValueSize, valColor, true);
-                curX += bw + m.infoGap;
-            }
+            Gdiplus::Color valColor = urgent
+                ? ToGdiColor(STALE_CLR)  // red when < 2h
+                : cValue;
+            const int labelW = TextWidth(
+                g, L"7d\u91CD\u7F6E", ff, (float)m.infoLabelSize, false);
+            const int valueW = TextWidth(
+                g, countdown.c_str(), ff, (float)m.infoValueSize, true);
+            const int bw = std::max(labelW, valueW);
+            const int totalH = m.infoLabelSize + 3 + m.infoValueSize;
+            const int by = cy - totalH / 2 + m.infoYOffset;
+            DrawTextAt(g, L"7d\u91CD\u7F6E", (float)(curX + (bw - labelW) / 2), (float)by, ff,
+                       (float)m.infoLabelSize, cLabel, false);
+            DrawTextAt(g, countdown.c_str(), (float)(curX + (bw - valueW) / 2),
+                       (float)(by + m.infoLabelSize + 3),
+                       ff, (float)m.infoValueSize, valColor, true);
+            curX += bw + m.infoGap;
         }
 
         // ── Separator 2 + per-source freshness status ──
@@ -711,12 +682,10 @@ public:
     void SetSnapshot(const DashData& d) {
         std::lock_guard<std::mutex> lk(mu_);
         data_ = d;
-        cachedW_ = 0;
     }
     void SetOptions(const PluginOptions& o) {
         std::lock_guard<std::mutex> lk(mu_);
         opts_ = o;
-        cachedW_ = 0;
     }
     PluginOptions GetOptions() const { std::lock_guard<std::mutex> lk(mu_); return opts_; }
     DashData GetSnapshot() const { std::lock_guard<std::mutex> lk(mu_); return data_; }
@@ -725,7 +694,6 @@ private:
     mutable std::mutex mu_;
     DashData data_;
     PluginOptions opts_;
-    mutable int cachedW_ = 0;
 };
 
 // =====================================================================
@@ -805,10 +773,11 @@ public:
         DashData snap = dash_.GetSnapshot();
 
         // Run connectivity test
-        auto conn = TestConnectivity();
+        auto conn = TestConnectivity(proxyConfig_);
 
         // Read proxy settings from config
         std::wstring proxyServer;
+        std::wstring allowedExitIps;
         bool requireProxy = false;
         std::wstring iniActualPath;
         if (!configDir_.empty()) {
@@ -819,6 +788,8 @@ public:
             proxyServer = buf;
             GetPrivateProfileStringW(L"AIUsage", L"RequireProxy", L"0", buf, 256, iniPath.c_str());
             requireProxy = (buf[0] == L'1');
+            GetPrivateProfileStringW(L"AIUsage", L"AllowedExitIPs", L"", buf, 256, iniPath.c_str());
+            allowedExitIps = buf;
         }
 
         // Build proxy status string
@@ -833,7 +804,9 @@ public:
 
         // Connectivity status
         std::wstring connStatus;
-        if (conn.directReachable && conn.proxyReachable) {
+        if (!conn.statusMessage.empty()) {
+            connStatus = conn.statusMessage;
+        } else if (conn.directReachable && conn.proxyReachable) {
             connStatus = L"Direct + Proxy OK";
         } else if (conn.directReachable) {
             connStatus = L"Direct OK (no proxy needed)";
@@ -871,7 +844,9 @@ public:
             L" 11. Custom Sub Expiry:     %s\n\n"
             L"Proxy Settings:\n"
             L"  Proxy Server:   %s\n"
-            L"  Require Proxy:  %s\n\n"
+            L"  Require Proxy:  %s\n"
+            L"  Allowed Exit IPs: %s\n"
+            L"  Observed Exit IP: %s\n\n"
             L"Connectivity Test:\n"
             L"  Direct:  %s\n"
             L"  Proxy:   %s\n"
@@ -896,9 +871,10 @@ public:
             L"  ShowCodex7dReset=1\n"
             L"  Show7dCountdown=1\n"
             L"  CountdownShowBeforeHours=12\n"
-            L"  CustomSubExpiry=2026-08-13\n"
-            L"  ProxyServer=127.0.0.1:7890\n"
-            L"  RequireProxy=0",
+            L"  CustomSubExpiry=\n"
+            L"  ProxyServer=\n"
+            L"  RequireProxy=1\n"
+            L"  AllowedExitIPs=203.0.113.10",
             o.showPctSign ? L"Yes" : L"No",
             o.showCredits ? L"Yes" : L"No",
             o.showReset ? L"Yes" : L"No",
@@ -912,6 +888,8 @@ public:
             o.customSubExpiry.empty() ? L"(auto)" : std::wstring(o.customSubExpiry.begin(), o.customSubExpiry.end()).c_str(),
             proxyServer.empty() ? L"(system)" : proxyServer.c_str(),
             requireProxy ? L"Yes" : L"No",
+            allowedExitIps.empty() ? L"(disabled)" : allowedExitIps.c_str(),
+            conn.observedExitIp.empty() ? L"(not checked)" : conn.observedExitIp.c_str(),
             conn.directReachable ? L"Yes" : L"No",
             conn.proxyReachable ? L"Yes" : L"No",
             connStatus.c_str(),
@@ -939,7 +917,7 @@ private:
         if (configDir_.empty()) return;
         std::wstring iniPath = configDir_ + L"\\AIUsage.ini";
         PluginOptions o;
-        wchar_t buf[256];
+        wchar_t buf[1024];
 
         GetPrivateProfileStringW(L"AIUsage", L"ShowPctSign", L"0", buf, 256, iniPath.c_str());
         o.showPctSign = (buf[0] == L'1');
@@ -974,7 +952,7 @@ private:
             1, 168);
 
         GetPrivateProfileStringW(
-            L"AIUsage", L"CustomSubExpiry", L"2026-08-13", buf, 256, iniPath.c_str());
+            L"AIUsage", L"CustomSubExpiry", L"", buf, 256, iniPath.c_str());
         // Convert wide to narrow
         o.customSubExpiry.clear();
         int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
@@ -986,13 +964,26 @@ private:
         dash_.SetOptions(o);
 
         // Read proxy settings
-        GetPrivateProfileStringW(L"AIUsage", L"ProxyServer", L"", buf, 256, iniPath.c_str());
+        GetPrivateProfileStringW(L"AIUsage", L"ProxyServer", L"", buf, 1024, iniPath.c_str());
         std::wstring proxyServer = buf;
 
-        GetPrivateProfileStringW(L"AIUsage", L"RequireProxy", L"0", buf, 256, iniPath.c_str());
+        GetPrivateProfileStringW(L"AIUsage", L"RequireProxy", L"0", buf, 1024, iniPath.c_str());
         bool requireProxy = (buf[0] == L'1');
 
-        proxyConfig_ = DetectProxy(proxyServer, requireProxy);
+        GetPrivateProfileStringW(L"AIUsage", L"AllowedExitIPs", L"", buf, 1024, iniPath.c_str());
+        std::wstring allowedExitIps = buf;
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ExitIpCheckUrl", L"https://api.ipify.org/",
+            buf, 1024, iniPath.c_str());
+        std::wstring exitIpCheckUrl = buf;
+
+        proxyConfig_ = DetectProxy(
+            proxyServer, requireProxy, allowedExitIps, exitIpCheckUrl);
+        GetPrivateProfileStringW(
+            L"AIUsage", L"VerifyTargetHostExitIp", L"1",
+            buf, 1024, iniPath.c_str());
+        proxyConfig_.verifyTargetHost = (buf[0] != L'0');
         claude_.SetProxyConfig(proxyConfig_);
         codex_.SetProxyConfig(proxyConfig_);
     }

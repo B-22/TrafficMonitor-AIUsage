@@ -85,6 +85,7 @@ target_link_libraries(AIUsage PRIVATE
     AIUsageCore
     shlwapi
     winhttp
+    ws2_32
     crypt32
     bcrypt
     gdiplus
@@ -108,3 +109,30 @@ endif()
 
 enable_testing()
 add_test(NAME CodexUsageTests COMMAND CodexUsageTests)
+
+add_executable(ProxyHelperTests
+    tests/ProxyHelperTests.cpp
+    src/ProxyHelper.cpp
+)
+
+target_include_directories(ProxyHelperTests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
+target_compile_definitions(ProxyHelperTests PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+
+target_link_libraries(ProxyHelperTests PRIVATE
+    winhttp
+    ws2_32
+)
+
+if(MSVC)
+    target_compile_options(ProxyHelperTests PRIVATE /utf-8)
+endif()
+
+add_test(NAME ProxyHelperTests COMMAND ProxyHelperTests)

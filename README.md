@@ -2,7 +2,9 @@
 
 TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude 和 Codex 的用量、Credits、订阅状态。
 
-信息块按各自最大文字宽度排版，上下标签与数值水平居中，并作为整体垂直居中。
+信息块按各自最大文字宽度排版，上下标签与数值水平居中，并相对圆环整体上移
+2 个逻辑像素。插件宽度只由显示开关决定，不随冷启动占位符、刷新结果或倒计时
+状态改变，避免 TrafficMonitor 重启后反复保存偏移而逐次扩大托盘前空白。
 
 ![Preview](docs/design/preview_final.png)
 
@@ -33,12 +35,12 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 | Credits 金额 | `ShowCredits` | 显示 | Claude 超额用量金额 |
 | 5h 重置时间 | `ShowReset` | 显示 | 下次 5h 窗口重置时间 |
 | 订阅状态 | `ShowSubscription` | 隐藏 | API 状态的红/绿点和文字 |
-| 手动到期日期 | `ShowCustomExpiry` | 显示 | 独立显示 `CustomSubExpiry`，任务栏格式如 `8.13` |
+| 手动到期日期 | `ShowCustomExpiry` | 隐藏 | 独立显示 `CustomSubExpiry`，任务栏格式如 `8.13` |
 | Claude 7d 重置星期 | `ShowClaude7dReset` | 显示 | 标签 `Claude`，值为一~日单字 |
 | Codex 7d 重置星期 | `ShowCodex7dReset` | 显示 | 标签 `Codex`，值为一~日单字 |
-| 7d 重置倒计时 | `Show7dCountdown` | 显示 | 仅在 `CountdownShowBeforeHours` 阈值内显示，默认 12 小时 |
+| 7d 重置倒计时 | `Show7dCountdown` | 显示 | 阈值外显示 `--` 以保持固定宽度；进入阈值后显示倒计时，默认 12 小时 |
 | 新鲜度提示 | `ShowStatus` | 显示 | Claude/Codex 分别判断；1 分钟黄线，5 分钟红线 |
-| 自定义订阅日期 | `CustomSubExpiry` | `2026-08-13` | 配置用完整日期，任务栏仅显示 `8.13` |
+| 自定义订阅日期 | `CustomSubExpiry` | 留空 | 可选的 `YYYY-MM-DD`，任务栏仅显示月日 |
 
 ### 圆环颜色逻辑
 
@@ -68,7 +70,8 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 
 - 自动选择较早的有效 7d 重置时间（Claude 或 Codex）
 - ISO 8601 时间统一按其 `Z`/时区偏移解析，再转换为 Windows 本地时间
-- 默认只在剩余 12 小时内显示，可通过 `CountdownShowBeforeHours` 调整
+- 默认在剩余 12 小时内显示倒计时，可通过 `CountdownShowBeforeHours` 调整；
+  阈值外显示固定宽度的 `--`
 - 显示 `5h30m` 倒计时格式
 - <2h：红色文字警告
 
@@ -95,9 +98,35 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 
 ### 代理配置
 
-- `ProxyServer`：显式指定代理地址（如 `http://127.0.0.1:7890`）
+- `ProxyServer`：显式指定代理地址（例如 `http://127.0.0.1:PORT`）
 - 留空使用系统网络栈（支持 TUN/VPN）
 - WinHTTP `AUTOMATIC_PROXY` 模式自动通过系统网络适配器路由
+- `RequireProxy=1`：没有显式/系统代理时 fail-closed；配置了
+  `AllowedExitIPs` 时，以出口 IP 校验作为 TUN/VPN 的放行条件
+- `AllowedExitIPs`：逗号或分号分隔的精确公网 IPv4/IPv6 白名单。非空时，
+  每次建立 Claude/Codex HTTP 会话前均通过同一路径查询公网 IP；检测失败或
+  不匹配时，不发送令牌刷新和用量请求
+- `ExitIpCheckUrl`：返回纯文本公网 IP 的 HTTPS 检测地址，默认
+  `https://api.ipify.org/`；HTTP 和重定向会被拒绝
+- `VerifyTargetHostExitIp=1`：在真实请求前访问同一目标域名的
+  `/cdn-cgi/trace` 并读取 `ip=`，确保检测与 API 请求命中相同的域名分流规则；
+  Claude、Codex 和令牌刷新域名会分别检测
+
+推荐的 TUN 配置：
+
+```ini
+ProxyServer=
+RequireProxy=1
+AllowedExitIPs=你的代理公网IP
+ExitIpCheckUrl=https://api.ipify.org/
+VerifyTargetHostExitIp=1
+```
+
+> 应用层“先检测出口、再访问 API”可以防住 TUN 关闭、切换失败和大多数误直连，
+> 但无法证明目标域名没有被代理软件的分流规则单独设置为直连。若账号风险要求
+> 接近硬保证，请同时启用代理客户端的 kill switch，或使用 Windows 防火墙/WFP
+> 将 `TrafficMonitor.exe` 限制到 TUN 接口；最确定的应用内方案仍是填写
+> `ProxyServer`，让全部请求只走一个显式代理。
 
 ### 安全
 
@@ -113,15 +142,18 @@ ShowPctSign=0          # 圆环内是否显示 %
 ShowCredits=1          # 显示 Credits 金额
 ShowReset=1            # 显示 5h 重置时间
 ShowSubscription=0     # 隐藏 API 订阅状态
-ShowCustomExpiry=1     # 显示手动到期日期
+ShowCustomExpiry=0     # 默认隐藏手动到期日期
 ShowStatus=1           # 显示分来源新鲜度短线和过期分钟数
 ShowClaude7dReset=1    # Claude 重置星期单字
 ShowCodex7dReset=1     # Codex 重置星期单字
 Show7dCountdown=1      # 阈值内显示最近的 7d 重置倒计时
 CountdownShowBeforeHours=12
-CustomSubExpiry=2026-08-13
+CustomSubExpiry=       # 可选 YYYY-MM-DD；仓库模板必须留空
 ProxyServer=           # 代理地址
-RequireProxy=0         # 0=不阻止(默认), 1=无代理时阻止
+RequireProxy=1         # 无代理时阻止；AllowedExitIPs 可作为 TUN 放行条件
+AllowedExitIPs=        # 精确公网 IP 白名单，非空即启用 fail-closed
+ExitIpCheckUrl=https://api.ipify.org/
+VerifyTargetHostExitIp=1
 ```
 
 ## 构建
@@ -139,8 +171,9 @@ ctest --test-dir build -C Release --output-on-failure
 ### 部署
 
 1. 关闭 TrafficMonitor
-2. 复制 `AIUsagePreview.dll` 到 `TrafficMonitor/plugins/`
-3. 复制 `AIUsage.ini` 到 TrafficMonitor 配置目录
+2. 直接覆盖 `TrafficMonitor/plugins/AIUsagePreview.dll`（默认不创建备份）
+3. 首次部署时复制 `AIUsage.ini` 到 TrafficMonitor 配置目录；更新 DLL 时不要用
+   仓库模板覆盖本机含出口 IP 等私有值的配置
 4. 启动 TrafficMonitor
 5. 在显示设置中启用 "AI Usage Dashboard"
 
@@ -148,6 +181,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 ```
 ├── CMakeLists.txt
+├── AGENTS.md                      # 协作、README 同步及隐私规范
 ├── AIUsage.ini                    # 配置模板
 ├── LICENSE
 ├── README.md
@@ -165,11 +199,22 @@ ctest --test-dir build -C Release --output-on-failure
 │   ├── JsonLite.cpp/h             # JSON 解析器
 │   └── CodexUsageVersion.h.in
 ├── tests/
-│   └── CodexUsageCoreTests.cpp
+│   ├── CodexUsageCoreTests.cpp
+│   └── ProxyHelperTests.cpp
 └── docs/
-    ├── CONTRIBUTING.md            # 协作规范
     └── design/                    # 设计稿
 ```
+
+## 协作与发布约束
+
+- 所有新增、变更或移除的功能、显示行为、配置键、安全策略、构建和部署方式，
+  必须在同一次提交中同步更新本 README；README 是公开功能说明的唯一入口。
+- 仓库文件、示例、测试和提交内容不得包含真实公网 IP、代理端口、令牌、账号、
+  邮箱、订阅日期、本机绝对路径或其他个人/机器信息。IP 示例只使用
+  RFC 5737/RFC 3849 文档保留地址，机器相关配置保持为空。
+- 本地发布默认直接覆盖 DLL，不创建 `_backup_*` 目录；需要回退时使用 Git 或
+  GitHub Release。只有用户明确要求时才另行备份。
+- 完整协作检查清单见 [`AGENTS.md`](AGENTS.md)。
 
 ## 致谢
 
