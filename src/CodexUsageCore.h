@@ -27,6 +27,7 @@ enum class FreshnessLevel {
 };
 
 std::wstring Utf8ToWide(const std::string& input);
+std::wstring FormatIsoDateAsMonthDay(const std::string& text);
 UsageSnapshot ParseUsageJson(const std::string& jsonText, std::wstring* errorMessage);
 std::optional<long long> ParseIso8601UtcSeconds(const std::string& text);
 FreshnessLevel ClassifyFreshness(double ageSeconds);

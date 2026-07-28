@@ -94,6 +94,15 @@ void FormatsDisplayText() {
     AssertEqual(FormatRemainingPercent(77), L"77%", "remaining percent text");
     AssertEqual(FormatRemainingPercent(-1), L"--", "negative percent text");
     AssertEqual(FormatRemainingPercent(101), L"--", "out-of-range percent text");
+    AssertEqual(
+        FormatIsoDateAsMonthDay("2099-08-13"), L"8.13",
+        "date-only subscription expiry should use month.day");
+    AssertEqual(
+        FormatIsoDateAsMonthDay("2026-02-30"), L"--",
+        "invalid subscription expiry should be rejected");
+    AssertEqual(
+        FormatIsoDateAsMonthDay("2024-02-29"), L"2.29",
+        "leap-day subscription expiry should be accepted");
 }
 
 void ParsesIso8601Timestamps() {

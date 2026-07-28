@@ -4,7 +4,8 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 
 信息块按各自最大文字宽度排版，上下标签与数值水平居中，并相对圆环整体上移
 2 个逻辑像素。插件宽度只由显示开关决定，不随冷启动占位符、刷新结果或倒计时
-状态改变，避免 TrafficMonitor 重启后反复保存偏移而逐次扩大托盘前空白。
+状态改变；右侧仅保留 2 个逻辑像素内边距，避免 TrafficMonitor 重启后反复保存
+偏移或在托盘前留下额外空白。
 
 ![Preview](docs/design/preview_final.png)
 
@@ -38,7 +39,7 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 | 手动到期日期 | `ShowCustomExpiry` | 隐藏 | 独立显示 `CustomSubExpiry`，任务栏格式如 `8.13` |
 | Claude 7d 重置星期 | `ShowClaude7dReset` | 显示 | 标签 `Claude`，值为一~日单字 |
 | Codex 7d 重置星期 | `ShowCodex7dReset` | 显示 | 标签 `Codex`，值为一~日单字 |
-| 7d 重置倒计时 | `Show7dCountdown` | 显示 | 阈值外显示 `--` 以保持固定宽度；进入阈值后显示倒计时，默认 12 小时 |
+| 7d 重置倒计时 | `Show7dCountdown` | 显示 | 不增加独立信息块；进入阈值后分别替换 Claude/Codex 星期值，默认 24 小时 |
 | 新鲜度提示 | `ShowStatus` | 显示 | Claude/Codex 分别判断；1 分钟黄线，5 分钟红线 |
 | 自定义订阅日期 | `CustomSubExpiry` | 留空 | 可选的 `YYYY-MM-DD`，任务栏仅显示月日 |
 
@@ -68,12 +69,13 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 
 ### 7d 重置倒计时
 
-- 自动选择较早的有效 7d 重置时间（Claude 或 Codex）
+- Claude 与 Codex 分别使用自己的 7d 重置时间
 - ISO 8601 时间统一按其 `Z`/时区偏移解析，再转换为 Windows 本地时间
-- 默认在剩余 12 小时内显示倒计时，可通过 `CountdownShowBeforeHours` 调整；
-  阈值外显示固定宽度的 `--`
+- 默认在剩余 24 小时内显示倒计时，可通过 `CountdownShowBeforeHours` 调整
+- 进入阈值后，原 Claude/Codex 星期值分别变为 `5h30m` 等具体倒计时；
+  阈值外继续显示原星期值，不创建单独的“7d重置”信息块
 - 显示 `5h30m` 倒计时格式
-- <2h：红色文字警告
+- 倒计时沿用普通数值颜色，不根据剩余时间变红
 
 ### 凭据读取
 
@@ -146,8 +148,8 @@ ShowCustomExpiry=0     # 默认隐藏手动到期日期
 ShowStatus=1           # 显示分来源新鲜度短线和过期分钟数
 ShowClaude7dReset=1    # Claude 重置星期单字
 ShowCodex7dReset=1     # Codex 重置星期单字
-Show7dCountdown=1      # 阈值内显示最近的 7d 重置倒计时
-CountdownShowBeforeHours=12
+Show7dCountdown=1      # 阈值内替换 Claude/Codex 各自的星期值
+CountdownShowBeforeHours=24
 CustomSubExpiry=       # 可选 YYYY-MM-DD；仓库模板必须留空
 ProxyServer=           # 代理地址
 RequireProxy=1         # 无代理时阻止；AllowedExitIPs 可作为 TUN 放行条件

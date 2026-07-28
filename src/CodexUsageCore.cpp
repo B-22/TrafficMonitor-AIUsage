@@ -204,6 +204,29 @@ FreshnessLevel ClassifyFreshness(double ageSeconds) {
     return FreshnessLevel::Fresh;
 }
 
+std::wstring FormatIsoDateAsMonthDay(const std::string& text) {
+    if (text.size() != 10 || text[4] != '-' || text[7] != '-') return L"--";
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (i == 4 || i == 7) continue;
+        if (text[i] < '0' || text[i] > '9') return L"--";
+    }
+
+    const int year = std::stoi(text.substr(0, 4));
+    const int month = std::stoi(text.substr(5, 2));
+    const int day = std::stoi(text.substr(8, 2));
+    if (year < 1601 || month < 1 || month > 12) return L"--";
+
+    static constexpr int daysInMonth[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    int maxDay = daysInMonth[month - 1];
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (month == 2 && leap) maxDay = 29;
+    if (day < 1 || day > maxDay) return L"--";
+
+    return std::to_wstring(month) + L"." + std::to_wstring(day);
+}
+
 FreshnessLevel ClassifyFreshnessForDisplay(double ageSeconds, bool refreshInProgress) {
     // A normal one-minute refresh briefly crosses the warning threshold while
     // its replacement request is still in flight. Suppress only that boundary.
