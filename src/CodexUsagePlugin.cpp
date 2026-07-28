@@ -933,8 +933,14 @@ public:
 
     void OnExtenedInfo(ExtendedInfoIndex idx, const wchar_t* data) override {
         if (idx == EI_CONFIG_DIR && data) {
-            configDir_ = data;
-            LoadConfig();
+            std::wstring candidateDir = data;
+            std::wstring candidateIni = candidateDir + L"\\AIUsage.ini";
+            const DWORD attributes = GetFileAttributesW(candidateIni.c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES
+                && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                configDir_ = std::move(candidateDir);
+                LoadConfig();
+            }
         }
     }
 
@@ -960,6 +966,11 @@ private:
     void LoadConfig() {
         if (configDir_.empty()) return;
         std::wstring iniPath = configDir_ + L"\\AIUsage.ini";
+        const DWORD attributes = GetFileAttributesW(iniPath.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES
+            || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            return;
+        }
         PluginOptions o;
         wchar_t buf[1024];
 

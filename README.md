@@ -139,7 +139,8 @@ VerifyTargetHostExitIp=1
 
 插件优先使用 TrafficMonitor 通过 `EI_CONFIG_DIR` 提供的配置目录；若宿主版本未
 发送该回调，则自动从当前 `TrafficMonitor.exe` 所在目录读取 `AIUsage.ini`。
-因此显示选项与出口 IP 锁不会因为宿主接口差异而静默退回默认值。
+宿主回调目录只有在其中真实存在 `AIUsage.ini` 时才允许覆盖当前有效配置，避免
+空目录回调把到期日期、显示选项和出口 IP 锁静默重置为默认值。
 
 ```ini
 [AIUsage]
