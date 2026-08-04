@@ -2,11 +2,126 @@
 
 TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude 和 Codex 的用量、Credits、订阅状态。
 
-信息块按实际标签和数值宽度排版，上下标签与数值水平居中，并相对圆环整体上移
-2 个逻辑像素。宽度测量与实际绘制使用同一组当前文字，不再按最大示例值预留后
-又把差值累积到最右端；右侧仅保留 2 个逻辑像素内边距。
+Windows 11 的视觉语言以 50 像素高的
+[`taskbar_preview.html`](docs/design/taskbar_preview.html) 为设计源：字号、字重、
+配色、水平间距和元素层级都按它来。文字统一使用 `Segoe UI` 常规字重。
 
-![Preview](docs/design/preview_final.png)
+**纵向坐标不能照搬设计稿。** TrafficMonitor 把自己的任务栏窗口高度写死为
+`TASKBAR_WND_HEIGHT`（`TaskBarDlg.h`，定义为 `DPI(32)`），`CalculateWindowSize()`
+直接使用该常量，与任务栏实际高度、字体大小、`vertical_margin` 都无关；
+`PluginInterface.h` 也没有让插件申请高度的接口。因此在 48 像素高的 Windows 11
+任务栏上，插件真正拿到的绘制槽位只有 96-DPI 下的 32 像素，居中嵌在任务栏里。
+按 50 像素固定框架定位会把 `5h` / `7d` 角标推到槽位上边缘之外、把来源名推到下边缘
+之外，两者都会被宿主裁掉。
+
+插件因此按宿主传入的项目矩形高度计算全部纵向坐标（`ComputeLayout`）：角标占据
+从槽位顶部到角标基线之间的区域（`5h` / `7d` 无下伸部，墨迹全部落在该区域内），
+圆环占据其下的剩余高度，信息区两行分别在各自的高度带内居中。槽位足够高时
+（约 40 像素以上）圆环下方的 `Claude` / `Codex` 来源名会自动出现；在
+TrafficMonitor 的 32 像素槽位上它不显示，改由信息区的 `Claude` / `Codex` 两列和
+两组圆环之间的分隔线区分来源。
+
+插件数值文字会采用 TrafficMonitor 当前任务栏预设传入的数值色；小标签使用插件的
+主题感知弱化色，避免宿主把标签和值都设成同一深色后显得粗重。“背景透明”和
+“自动适应 Windows 深色/浅色主题”会继续对 AIUsage 生效。圆环轨道、用量状态色、
+分隔线和无数据状态由插件根据宿主传入的背景明暗切换深浅调色板。透明模式下插件
+不会自行填充矩形背景。
+
+浅色模式下的圆环轨道和分隔线比设计稿更深。设计稿画在 `#f6f6f6` 页面上，而插件
+从不画在该颜色上：TrafficMonitor 会把配置的任务栏背景色作为色键从分层窗口中扣掉，
+圆环背后露出的是 Windows 11 任务栏本身（浅色模式实测约 `RGB(240,242,244)`），
+设计稿的 `#e6e6e6` 轨道与之只差约 10 级灰度，等于看不见。次级文字同样加深：
+7-8 像素字号的抗锯齿覆盖率达不到满值，中灰会被冲淡。
+
+文本抗锯齿使用灰度而非 ClearType。宿主的任务栏窗口是带色键的分层窗口，插件看不到
+最终背景，ClearType 的子像素滤波会在小字上留下紫绿彩边且没有实心笔画。
+
+即使 TrafficMonitor 的“渲染设置”选择 Direct2D，当前插件接口仍以 API 7 的
+`DrawItem(HDC)` 交给宿主，TrafficMonitor 再通过 Direct2D/GDI 互操作合成；这与宿主
+显示 Direct2D 并不矛盾。悬浮提示接口也只接受一段原生纯文本，不能设置圆角、背景、
+字体层级或按钮。本插件因此只重排原生提示的信息层级，不挂钩 TrafficMonitor 窗口，
+也不创建覆盖任务栏的自绘弹窗。
+
+### Windows 11 任务栏视觉基准
+
+![HTML exported Windows 11 taskbar visual specification](docs/design/taskbar-visual-spec-html.png)
+
+上图由设计 HTML 在 736×50 视口中直接导出，不是手工重画的概念图。原批准稿
+[`taskbar-visual-spec-win11.png`](docs/design/taskbar-visual-spec-win11.png) 保留为
+对照。它描述的是 50 像素槽位下的完整形态：水平间距、字号和配色按它执行，纵向坐标
+按下节的规则从实际槽位高度推导。
+
+水平常量（96-DPI，相对插件区域）：
+
+| 项目 | 值 |
+|------|-----|
+| 插件左内边距 | `10` |
+| 圆环盒（正方形，同时决定单元宽度） | 由槽位高度推导，上限 `28` |
+| 圆环描边 / 环内数字 | 圆环盒的 `2.2/28` / `0.45` |
+| 同组两环间距 | `6` |
+| 两组圆环间距（分隔线居中） | `11` |
+| 信息区分隔线左右留白 | `5 + 5` |
+| 信息块间距 | `11` |
+| 角标 / 来源名 / 信息标签 / 信息数值 字号 | `7 / 6.5 / 8 / 11` |
+
+纵向坐标由 `ComputeLayout` 按宿主槽位高度推导，32 像素槽位下的实测结果：
+
+| 项目 | 槽位内 y |
+|------|----------|
+| 槽位高度（`TASKBAR_WND_HEIGHT`） | `32` |
+| `5h` / `7d` 角标带（顶部到角标基线） | `0 ~ 7` |
+| 圆环（外径约 `23`，圆心 `19`） | `7 ~ 30` |
+| 分隔线 | `4.5 ~ 29` |
+| 信息标签 / 数值行中心 | `7.2 / 23.2` |
+| `Claude` / `Codex` 来源名 | 不显示（槽位不足 40） |
+
+TrafficMonitor 在插件左侧另有约 10 像素宿主间距，不计入上述插件内部坐标。
+
+## Codex 重置卡与全局重置雷达
+
+- 插件从 `~/.codex/auth.json` 只读获取 `tokens.access_token`，请求
+  `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`。悬浮提示会显示
+  可用重置卡总数，以及接口返回的每张可用卡的发放时间和本地过期时间；不会显示
+  access token、refresh token、账号 ID 或重置卡完整 ID。该 `wham` 地址是 ChatGPT
+  内部接口，并非稳定的公开 API；若服务端字段或鉴权方式变化，插件会在悬浮提示中
+  报错并保持用量主接口独立工作。
+- 可用卡中最早一张在 48 小时内过期时，`Codex` 星期栏优先改成紧凑的
+  `2卡18h` / `1卡35m`。该值在深色任务栏使用亮黄到粉色渐变，在浅色任务栏使用
+  深红到紫色渐变；过期预警优先于 7d 倒计时、新鲜度分钟数和星期。
+- “今日是否全局重置”以 [Codex Runway](https://github.com/Licoy/codex-runway) 的
+  匿名静态 v1 feed `https://codexreset.gitcdn.top/api/status.json` 为主基准，默认每
+  60 分钟刷新。插件会严格校验 schema、监控状态、事件类型、置信度、固定说明、
+  `@thsottiaux` 证据链接和适用范围，再按本机日期判断“是 / 否 / 未知”。同日已完成
+  重置或同日未来计划为“是”；30 小时未成功更新、监控降级或存在无法确认的同日事件
+  时 fail-to-unknown，不把旧信息继续当作确定结论。
+- [codex-reset.com 的公开 forecast API](https://codex-reset.com/api/forecast) 和
+  [Codex 雷达公开摘要](https://codex-reset-radar.pages.dev/current.json) 仍每
+  15 分钟刷新，作为次级补充，保留 24/48 小时概率。Runway 有新鲜且明确的“是/否”
+  时优先；Runway 不可用或为“未知”时，次级来源才决定公告窗口。次级开启信号超过
+  12 小时会被忽略。
+- 主源判断为“是”或主源未知而次级公告窗口开启时，四个圆环左侧出现渐变闪电 `⚡`。
+  原生悬浮提示按“配额 / 今日全局重置 / 账户 / 状态”分段，显示主源结论、计划或最近
+  重置时间、范围、置信度、补充概率、更新时间、重置卡和网络状态。
+- 雷达和概率均来自独立社区站点，只能作为提醒，不能保证 OpenAI 一定重置，也不能替代
+  账号自己的 5h/7d 服务端重置时间。
+
+新增配置：
+
+```ini
+ShowResetCreditWarning=1    # 1=在 Codex 星期栏显示临期卡
+ResetCreditWarningHours=48  # 最早可用卡进入多少小时后开始警告
+ShowResetRadar=1            # 1=监控全局“速蹬窗口”
+ResetRadarRefreshMinutes=15 # 允许 5-120 分钟
+RunwayResetRefreshMinutes=60 # 主源刷新，允许 15-240 分钟
+```
+
+Codex 用量和重置卡接口继续复用插件现有的代理与出口 IP 检查；启用
+`AllowedExitIPs` 时，`chatgpt.com` 会在真实请求前走相同的 fail-closed 预检。三个社区
+重置接口是匿名公共数据，不发送 token、账号 ID 或 Cookie，因此不应用 `RequireProxy`
+和 `AllowedExitIPs` 限制，避免公共站点不支持目标域名出口检查时被误判为“IP 屏蔽”；
+如果已配置显式或系统代理，重置源仍沿用该代理路由。第三方源失败不会阻断
+Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过 30 小时只显示“未知”，
+次级开启信号只在 12 小时新鲜度范围内有效。
 
 ## 功能完整列表
 
@@ -23,14 +138,18 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 | Codex 5h 用量 | `/backend-api/wham/usage` | 5 小时窗口已用百分比 |
 | Codex 7d 用量 | `/backend-api/wham/usage` | 7 天窗口已用百分比 |
 | Codex 7d 重置时间 | `/backend-api/wham/usage` `reset_at` | 下次 7d 窗口重置时间 |
+| Codex 重置卡 | `/backend-api/wham/rate-limit-reset-credits` | 可用总数、逐卡发放/过期时间 |
+| 今日全局重置 | Codex Runway `api/status.json` | 本地日期的“是 / 否 / 未知”、计划、范围与证据 |
+| 全局重置补充预测 | `codex-reset.com/api/forecast` + Codex 雷达公开摘要 | 次级公告窗口与 24/48h 概率 |
 
 ### 显示项（均可独立开关）
 
 | 显示项 | 配置键 | 默认 | 说明 |
 |--------|--------|------|------|
-| Claude 5h 圆环 | 自动 | 始终显示 | 橙色环，百分比数字 |
-| Claude 7d 圆环 | 自动 | 始终显示 | 橙色环，百分比数字 |
-| Codex 7d 圆环 | 自动 | 始终显示 | 青色环，百分比数字 |
+| Claude 5h 圆环 | 自动 | 始终显示 | 第一组 5h，用量色环和百分比数字 |
+| Claude 7d 圆环 | 自动 | 始终显示 | 第一组 7d，用量色环和百分比数字 |
+| Codex 5h 圆环 | 自动 | 始终显示 | 第二组 5h，用量色环和百分比数字 |
+| Codex 7d 圆环 | 自动 | 始终显示 | 第二组 7d，用量色环和百分比数字 |
 | 百分比号 | `ShowPctSign` | 隐藏 | 0=只显示数字, 1=显示% |
 | Credits 金额 | `ShowCredits` | 显示 | Claude 超额用量金额 |
 | 5h 重置时间 | `ShowReset` | 显示 | 下次 5h 窗口重置时间 |
@@ -39,6 +158,8 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 | Claude 7d 重置星期 | `ShowClaude7dReset` | 显示 | 标签 `Claude`，值为一~日单字 |
 | Codex 7d 重置星期 | `ShowCodex7dReset` | 显示 | 标签 `Codex`，值为一~日单字 |
 | 7d 重置倒计时 | `Show7dCountdown` | 显示 | 不增加独立信息块；进入阈值后分别替换 Claude/Codex 星期值，默认 24 小时 |
+| 重置卡临期警告 | `ShowResetCreditWarning` | 显示 | 最早可用卡 48h 内过期时替换 Codex 星期值并使用对比度渐变 |
+| 全局重置标记 | `ShowResetRadar` | 显示 | 主源判断为“是”或主源未知且次级窗口开启时，在圆环左侧显示 `⚡` |
 | 新鲜度提示 | `ShowStatus` | 显示 | Claude/Codex 分别判断；1 分钟黄线，5 分钟红线 |
 | 自定义订阅日期 | `CustomSubExpiry` | 留空 | 可选的 `YYYY-MM-DD`，任务栏仅显示月日 |
 
@@ -46,10 +167,20 @@ TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显�
 
 | 百分比 | 颜色 |
 |--------|------|
-| 0-59% | Claude 橙色 `#c66c32` / Codex 青色 `#2ea8b1` |
-| 60-84% | 警告橙色 |
-| 85-100% | 红色 |
+| 0-59% | 绿色，正常 |
+| 60-79% | 黄色，提醒 |
+| 80-89% | 橙色，偏高 |
+| 90-100% | 红色，紧张 |
 | 无数据 | 灰色 |
+
+圆环颜色只表达用量等级，不再表达 Claude/Codex 来源。四个圆环固定按
+`Claude 5h、Claude 7d｜Codex 5h、Codex 7d` 排列，两组之间使用细分隔线，
+每个圆环右上角有 `5h` / `7d` 角标；槽位高度足够时每组下方还会显示来源名称
+（TrafficMonitor 的 32 像素槽位不足以显示，此时由信息区的 `Claude` / `Codex`
+两列区分）。因此在黑白或色觉差异环境中同样能区分来源。
+
+圆环数字和信息块数值跟随 TrafficMonitor 的数值文字颜色，圆环角标和信息块标签
+跟随标签文字颜色。未勾选“指定每个项目的颜色”时，两者均跟随任务栏全局文字颜色。
 
 ### 订阅状态指示
 
@@ -154,6 +285,11 @@ ShowClaude7dReset=1    # Claude 重置星期单字
 ShowCodex7dReset=1     # Codex 重置星期单字
 Show7dCountdown=1      # 阈值内替换 Claude/Codex 各自的星期值
 CountdownShowBeforeHours=24
+ShowResetCreditWarning=1
+ResetCreditWarningHours=48
+ShowResetRadar=1
+ResetRadarRefreshMinutes=15
+RunwayResetRefreshMinutes=60
 CustomSubExpiry=       # 可选 YYYY-MM-DD；仓库模板必须留空
 ProxyServer=           # 代理地址
 RequireProxy=1         # 无代理时阻止；AllowedExitIPs 可作为 TUN 放行条件
@@ -234,6 +370,9 @@ DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本�
 - **[huanchong-99/claude-usage-assistant](https://github.com/huanchong-99/claude-usage-assistant)** — Claude 凭据读取、DPAPI 解密、OAuth 刷新、usage API 参考
 - **[bemaru/trafficmonitor-ai-usage-plugin](https://github.com/bemaru/trafficmonitor-ai-usage-plugin)** — PluginInterface.h
 - **[zhongyang219/TrafficMonitor](https://github.com/zhongyang219/TrafficMonitor)** — 插件接口和任务栏嵌入框架
+- **[Licoy/codex-runway](https://github.com/Licoy/codex-runway)** — 今日重置公开
+  feed、schema 与悬浮信息层级参考。上游采用 AGPL-3.0；本插件未复制其 Swift/服务端
+  源码，只独立实现公开 v1 数据格式的 Windows 消费端。
 
 ## 许可证
 

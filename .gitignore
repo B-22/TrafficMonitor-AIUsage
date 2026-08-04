@@ -1,6 +1,11 @@
 build*/
 .history/
-docs/
+docs/*
+!docs/design/
+docs/design/*
+!docs/design/taskbar_preview.html
+!docs/design/taskbar-visual-spec-html.png
+!docs/design/taskbar-visual-spec-win11.png
 .trae/
 _recycle_bin/
 

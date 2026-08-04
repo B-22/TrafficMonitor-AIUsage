@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIUsage Windows 11 taskbar visual specification</title>
+  <style>
+    /*
+      Canonical 100% / 96-DPI layout.
+
+      The outer 10 px represents TrafficMonitor's placement margin. All values
+      under "plugin slot" map 1:1 to the native renderer:
+
+        slot top / height       0 / 50
+        dashboard left padding 10
+        ring box / visible OD  28 / 25.8
+        ring stroke            2.2
+        ring gap               6
+        provider group gap     11 (divider centered within it)
+        info divider margins   5 + 5
+        divider top / height   12 / 26
+        ring center y          25
+        corner label left      ring-box-left + 22
+        corner label top       2
+        provider label top     40
+    */
+    :root {
+      color-scheme: light;
+      --stage-width: 736px;
+      --taskbar-width: 463px;
+      --taskbar-height: 50px;
+      --host-margin-left: 10px;
+      --plugin-pad-left: 10px;
+
+      --ring-box: 28px;
+      --ring-radius: 11.8px;
+      --ring-stroke: 2.2px;
+      --ring-gap: 6px;
+      --provider-gap: 11px;
+      --info-divider-margin: 5px;
+      --divider-top: 12px;
+      --divider-height: 26px;
+
+      --taskbar-bg: #f6f6f6;
+      --ring-track: #e6e6e6;
+      --usage-normal: #64ca78;
+      --usage-warning: #ee863e;
+      --usage-elevated: #dd5110;
+      --usage-danger: #df3d45;
+      --text-primary: #1a1c1f;
+      --text-secondary: #57585a;
+      --text-tertiary: #8f9091;
+      --divider: #d1d2d2;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: var(--stage-width);
+      height: var(--taskbar-height);
+      margin: 0;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    body {
+      font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+      font-weight: 400;
+      font-synthesis: none;
+      text-rendering: geometricPrecision;
+    }
+
+    .taskbar {
+      position: relative;
+      width: var(--taskbar-width);
+      height: var(--taskbar-height);
+      overflow: hidden;
+      background: var(--taskbar-bg);
+      color: var(--text-primary);
+    }
+
+    .plugin-slot {
+      position: absolute;
+      inset: 0 0 0 var(--host-margin-left);
+      height: var(--taskbar-height);
+    }
+
+    .ring-area {
+      position: absolute;
+      inset: 0 auto 0 var(--plugin-pad-left);
+      width: 145px;
+      height: var(--taskbar-height);
+    }
+
+    .ring {
+      position: absolute;
+      top: 0;
+      width: var(--ring-box);
+      height: var(--taskbar-height);
+    }
+
+    .ring:nth-of-type(1) { left: 0; }
+    .ring:nth-of-type(2) { left: 34px; }
+    .ring:nth-of-type(3) { left: 73px; }
+    .ring:nth-of-type(4) { left: 107px; }
+
+    .gauge {
+      position: absolute;
+      left: 0;
+      top: 11px;
+      width: var(--ring-box);
+      height: var(--ring-box);
+      overflow: visible;
+    }
+
+    .gauge circle {
+      fill: none;
+      cx: 14px;
+      cy: 14px;
+      r: var(--ring-radius);
+      stroke-width: var(--ring-stroke);
+    }
+
+    .track {
+      stroke: var(--ring-track);
+    }
+
+    .progress {
+      transform: rotate(-90deg);
+      transform-origin: 14px 14px;
+      stroke-linecap: round;
+      stroke-dasharray: var(--usage) 100;
+    }
+
+    .normal   { stroke: var(--usage-normal); }
+    .warning  { stroke: var(--usage-warning); }
+    .elevated { stroke: var(--usage-elevated); }
+    .danger   { stroke: var(--usage-danger); }
+
+    .ring-value {
+      position: absolute;
+      left: 14px;
+      top: 24px;
+      min-width: 24px;
+      color: var(--text-primary);
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 11px;
+      text-align: center;
+      transform: translate(-50%, -50%);
+      white-space: nowrap;
+    }
+
+    .ring-corner {
+      position: absolute;
+      left: 22px;
+      top: 2px;
+      color: var(--text-secondary);
+      font-size: 7px;
+      font-weight: 400;
+      line-height: 8px;
+      white-space: nowrap;
+    }
+
+    .provider {
+      position: absolute;
+      top: 40px;
+      color: var(--text-tertiary);
+      font-size: 6.5px;
+      font-weight: 400;
+      line-height: 7px;
+      text-align: center;
+      white-space: nowrap;
+      transform: translateX(-50%);
+    }
+
+    .provider.claude { left: 31px; }
+    .provider.codex  { left: 104px; }
+
+    .divider {
+      position: absolute;
+      top: var(--divider-top);
+      width: 1px;
+      height: var(--divider-height);
+      background: var(--divider);
+    }
+
+    .provider-divider { left: 67px; }
+    .info-divider     { left: 140px; }
+
+    .info-strip {
+      position: absolute;
+      top: 0;
+      left: 155px;
+      height: var(--taskbar-height);
+      display: flex;
+      align-items: stretch;
+      gap: 11px;
+    }
+
+    .info-block {
+      position: relative;
+      flex: 0 0 auto;
+      height: var(--taskbar-height);
+      min-width: max-content;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    .info-label {
+      position: absolute;
+      top: 7px;
+      left: 50%;
+      color: var(--text-secondary);
+      font-size: 8px;
+      font-weight: 400;
+      line-height: 9px;
+      transform: translateX(-50%);
+    }
+
+    .info-value {
+      position: absolute;
+      top: 23px;
+      left: 50%;
+      color: var(--text-primary);
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 13px;
+      transform: translateX(-50%);
+    }
+
+    .info-block.credits { width: 36px; }
+    .info-block.reset   { width: 29px; }
+    .info-block.expiry  { width: 23px; }
+    .info-block.claude  { width: 35px; }
+    .info-block.codex   { width: 24px; }
+
+    .clock {
+      position: absolute;
+      top: 0;
+      right: 7px;
+      width: 54px;
+      height: var(--taskbar-height);
+      color: var(--text-primary);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .clock-time {
+      position: absolute;
+      top: 5px;
+      right: 0;
+      font-size: 12px;
+      line-height: 14px;
+    }
+
+    .clock-date {
+      position: absolute;
+      top: 26px;
+      right: 0;
+      font-size: 11px;
+      line-height: 13px;
+    }
+  </style>
+</head>
+<body>
+  <main class="taskbar" aria-label="Windows 11 taskbar visual specification">
+    <section class="plugin-slot" aria-label="AI Usage Dashboard">
+      <div class="ring-area">
+        <div class="ring">
+          <svg class="gauge" viewBox="0 0 28 28" aria-hidden="true">
+            <circle class="track" pathLength="100"></circle>
+          </svg>
+          <span class="ring-value">0</span>
+          <span class="ring-corner">5h</span>
+        </div>
+
+        <div class="ring">
+          <svg class="gauge" viewBox="0 0 28 28" aria-hidden="true">
+            <circle class="track" pathLength="100"></circle>
+            <circle class="progress warning" pathLength="100" style="--usage: 67"></circle>
+          </svg>
+          <span class="ring-value">67</span>
+          <span class="ring-corner">7d</span>
+        </div>
+
+        <div class="ring">
+          <svg class="gauge" viewBox="0 0 28 28" aria-hidden="true">
+            <circle class="track" pathLength="100"></circle>
+            <circle class="progress normal" pathLength="100" style="--usage: 24"></circle>
+          </svg>
+          <span class="ring-value">24</span>
+          <span class="ring-corner">5h</span>
+        </div>
+
+        <div class="ring">
+          <svg class="gauge" viewBox="0 0 28 28" aria-hidden="true">
+            <circle class="track" pathLength="100"></circle>
+            <circle class="progress elevated" pathLength="100" style="--usage: 81"></circle>
+          </svg>
+          <span class="ring-value">81</span>
+          <span class="ring-corner">7d</span>
+        </div>
+
+        <span class="provider claude">Claude</span>
+        <span class="provider codex">Codex</span>
+        <i class="divider provider-divider" aria-hidden="true"></i>
+        <i class="divider info-divider" aria-hidden="true"></i>
+      </div>
+
+      <div class="info-strip">
+        <div class="info-block credits">
+          <span class="info-label">Credits</span>
+          <span class="info-value">$18.89</span>
+        </div>
+        <div class="info-block reset">
+          <span class="info-label">5h重置</span>
+          <span class="info-value">10:50</span>
+        </div>
+        <div class="info-block expiry">
+          <span class="info-label">到期</span>
+          <span class="info-value">8.13</span>
+        </div>
+        <div class="info-block claude">
+          <span class="info-label">Claude</span>
+          <span class="info-value">9h27m</span>
+        </div>
+        <div class="info-block codex">
+          <span class="info-label">Codex</span>
+          <span class="info-value">三</span>
+        </div>
+      </div>
+
+      <div class="clock" aria-label="Clock">
+        <span class="clock-time">9:32</span>
+        <span class="clock-date">2026/7/31</span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

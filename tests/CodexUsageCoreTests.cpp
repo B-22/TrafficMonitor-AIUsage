@@ -161,6 +161,248 @@ void BuildsMultiLineSuccessTooltip() {
         "multi-line success tooltip");
 }
 
+void ParsesResetCreditsAndExpiryWarning() {
+    const std::string json = R"json({
+        "available_count": 3,
+        "credits": [
+            {
+                "status": "available",
+                "title": "Full reset",
+                "granted_at": "2026-07-29T00:00:00Z",
+                "expires_at": "2026-07-31T00:00:00Z"
+            },
+            {
+                "status": "available",
+                "granted_at": "2026-07-29T01:00:00Z",
+                "expires_at": "2026-07-30T12:00:00Z"
+            },
+            {
+                "status": "redeemed",
+                "expires_at": "2026-07-30T01:00:00Z"
+            }
+        ]
+    })json";
+
+    std::wstring error;
+    const ResetCreditsSnapshot snapshot =
+        ParseResetCreditsJson(json, &error);
+    const long long now =
+        *ParseIso8601UtcSeconds("2026-07-30T00:00:00Z");
+    const long long expectedExpiry =
+        *ParseIso8601UtcSeconds("2026-07-30T12:00:00Z");
+
+    AssertTrue(snapshot.success, "reset credits should parse");
+    AssertEqual(snapshot.availableCount, 3, "available reset-credit count");
+    AssertEqual(
+        static_cast<int>(
+            EarliestAvailableResetCreditExpiry(snapshot, now)
+            - expectedExpiry),
+        0,
+        "earliest available reset-credit expiry");
+    AssertTrue(
+        IsResetCreditExpiringSoon(snapshot, now, 48),
+        "credit within 48 hours should warn");
+    AssertTrue(
+        !IsResetCreditExpiringSoon(snapshot, now, 11),
+        "credit outside 11 hours should not warn");
+    AssertEqual(
+        FormatResetCreditWarning(3, 12 * 3600),
+        L"3\u536112h",
+        "reset-credit warning text");
+}
+
+void ParsesAndMergesResetRadarSignals() {
+    const std::string summaryJson = R"json({
+        "monitored_at": "2026-07-30T08:00:00+08:00",
+        "window_open": true,
+        "window": {
+            "open": true,
+            "message": "Lands in the next hour",
+            "opened_at": "2026-07-30T07:50:00+08:00"
+        },
+        "prediction": {
+            "probability_24h": 0.55,
+            "probability_48h": 0.75
+        }
+    })json";
+    const std::string quietForecastJson = R"json({
+        "updated_at": "2026-07-30T00:05:00Z",
+        "official_signal": null,
+        "probabilities": {
+            "rounded_24h": 15,
+            "rounded_48h": 30
+        }
+    })json";
+    const std::string activeForecastJson = R"json({
+        "updated_at": "2026-07-30T00:05:00Z",
+        "official_signal": {
+            "at": "2026-07-30T00:01:00Z",
+            "summary": "Reset announced"
+        },
+        "probabilities": {
+            "rounded_24h": 90,
+            "rounded_48h": 95
+        }
+    })json";
+    const std::string malformedSignalForecastJson = R"json({
+        "updated_at": "2026-07-30T00:05:00Z",
+        "official_signal": false,
+        "probabilities": {
+            "rounded_24h": 15,
+            "rounded_48h": 30
+        }
+    })json";
+
+    std::wstring error;
+    const ResetRadarSnapshot summary =
+        ParseResetRadarSummaryJson(summaryJson, &error);
+    const ResetRadarSnapshot quiet =
+        ParseResetForecastJson(quietForecastJson, &error);
+    const ResetRadarSnapshot active =
+        ParseResetForecastJson(activeForecastJson, &error);
+    const ResetRadarSnapshot malformedSignal =
+        ParseResetForecastJson(malformedSignalForecastJson, &error);
+    const long long now =
+        *ParseIso8601UtcSeconds("2026-07-30T00:10:00Z");
+
+    AssertTrue(summary.success, "radar summary should parse");
+    AssertTrue(quiet.success, "quiet reset forecast should parse");
+    AssertTrue(active.success, "active reset forecast should parse");
+    AssertTrue(!quiet.forecastWindowOpen, "null official signal should be quiet");
+    AssertTrue(active.forecastWindowOpen, "object official signal should open window");
+    AssertTrue(
+        !malformedSignal.forecastWindowOpen,
+        "unexpected official signal types must fail quiet");
+
+    const ResetRadarSnapshot merged =
+        MergeResetRadarSnapshots(summary, quiet, now);
+    AssertTrue(merged.windowOpen, "fresh summary signal should open merged window");
+    AssertEqual(merged.probability24h, 15, "forecast probability should win");
+    AssertEqual(merged.probability48h, 30, "forecast 48h probability should win");
+
+    const ResetRadarSnapshot activeMerged =
+        MergeResetRadarSnapshots({}, active, now);
+    AssertTrue(
+        activeMerged.windowOpen,
+        "fresh official signal should open merged window");
+    AssertEqual(
+        activeMerged.message,
+        L"Reset announced",
+        "official signal summary");
+
+    const long long staleNow = now + 13 * 60 * 60;
+    const ResetRadarSnapshot stale =
+        MergeResetRadarSnapshots(summary, active, staleNow);
+    AssertTrue(
+        !stale.windowOpen,
+        "signals older than the maximum age should be ignored");
+}
+
+void ParsesCodexRunwayResetTodayFeed() {
+    const long long now =
+        *ParseIso8601UtcSeconds("2026-07-31T12:00:00Z");
+    const std::string completedJson = R"json({
+        "schemaVersion": 1,
+        "generatedAt": "2026-07-31T12:00:00Z",
+        "lastSuccessfulCheckAt": "2026-07-31T12:00:00Z",
+        "monitor": {
+            "status": "ok",
+            "errorCode": null
+        },
+        "events": [{
+            "kind": "reset_completed",
+            "announcedAt": "2026-07-31T12:00:00Z",
+            "effectiveAt": "2026-07-31T12:00:00Z",
+            "confidence": 0.9,
+            "rationale": "Explicit Codex quota reset announcement.",
+            "source": {
+                "handle": "thsottiaux",
+                "postId": "1951234567890123456",
+                "url": "https://x.com/thsottiaux/status/1951234567890123456"
+            },
+            "scope": {
+                "plans": ["all"],
+                "windows": ["weekly"]
+            }
+        }]
+    })json";
+
+    std::wstring error;
+    const ResetRadarSnapshot completed =
+        ParseCodexRunwayResetStatusJson(completedJson, now, &error);
+    AssertTrue(completed.success, "Runway feed should parse");
+    AssertTrue(
+        completed.todayState == ResetTodayState::Yes,
+        "same-day completed reset should resolve to yes");
+    AssertTrue(completed.windowOpen, "Runway yes should open reset window");
+    AssertEqual(completed.confidencePercent, 90, "Runway confidence");
+    AssertEqual(
+        completed.evidenceUrl,
+        L"https://x.com/thsottiaux/status/1951234567890123456",
+        "Runway evidence URL");
+    AssertTrue(
+        completed.latestResetAtUnixSeconds == now,
+        "completed reset timestamp should be preserved");
+
+    const std::string quietJson = R"json({
+        "schemaVersion": 1,
+        "generatedAt": "2026-07-31T12:00:00Z",
+        "lastSuccessfulCheckAt": "2026-07-31T12:00:00Z",
+        "monitor": {
+            "status": "ok",
+            "errorCode": null
+        },
+        "events": []
+    })json";
+    const ResetRadarSnapshot quiet =
+        ParseCodexRunwayResetStatusJson(quietJson, now, &error);
+    AssertTrue(quiet.success, "quiet Runway feed should parse");
+    AssertTrue(
+        quiet.todayState == ResetTodayState::No,
+        "fresh feed without same-day evidence should resolve to no");
+
+    ResetRadarSnapshot forecast;
+    forecast.success = true;
+    forecast.windowOpen = true;
+    forecast.forecastWindowOpen = true;
+    forecast.probability24h = 88;
+    forecast.updatedAtUnixSeconds = now;
+    const ResetRadarSnapshot merged =
+        MergeResetRadarSnapshots(quiet, {}, forecast, now);
+    AssertTrue(
+        merged.runwayPrimary,
+        "fresh conclusive Runway state should be primary");
+    AssertTrue(
+        !merged.windowOpen,
+        "Runway no should override a secondary open-window forecast");
+    AssertEqual(
+        merged.probability24h,
+        88,
+        "secondary probability should remain available");
+
+    const long long staleNow = now + 31 * 60 * 60;
+    const ResetRadarSnapshot stale =
+        ParseCodexRunwayResetStatusJson(quietJson, staleNow, &error);
+    AssertTrue(stale.success, "stale Runway payload should remain parseable");
+    AssertTrue(
+        stale.todayState == ResetTodayState::Unknown,
+        "stale Runway payload should fail to unknown");
+
+    std::string invalidSourceJson = completedJson;
+    const std::string validHost = "https://x.com/thsottiaux/status/";
+    const size_t sourcePosition = invalidSourceJson.find(validHost);
+    AssertTrue(
+        sourcePosition != std::string::npos,
+        "test fixture should contain source host");
+    invalidSourceJson.replace(
+        sourcePosition, validHost.size(), "https://example.com/status/");
+    const ResetRadarSnapshot invalid =
+        ParseCodexRunwayResetStatusJson(invalidSourceJson, now, &error);
+    AssertTrue(
+        !invalid.success,
+        "non-canonical Runway evidence URL should be rejected");
+}
+
 void HasGeneratedVersion() {
     AssertTrue(std::wstring(CODEX_USAGE_VERSION_WIDE).size() > 0, "generated version should not be empty");
 }
@@ -174,6 +416,9 @@ int main() {
     ParsesIso8601Timestamps();
     ClassifiesFreshnessAndCountdownWindow();
     BuildsMultiLineSuccessTooltip();
+    ParsesResetCreditsAndExpiryWarning();
+    ParsesAndMergesResetRadarSignals();
+    ParsesCodexRunwayResetTodayFeed();
     HasGeneratedVersion();
     return 0;
 }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-set(CODEX_USAGE_VERSION "0.4.2" CACHE STRING "AIUsage plugin version")
+set(CODEX_USAGE_VERSION "0.5.0" CACHE STRING "AIUsage plugin version")
 
 project(AIUsage VERSION "${CODEX_USAGE_VERSION}" LANGUAGES CXX)
 
@@ -58,6 +58,7 @@ endif()
 # DLL: plugin + Claude fetcher + Codex fetcher + DPAPI + credential reader
 add_library(AIUsage SHARED
     src/CodexUsagePlugin.cpp
+    src/DashboardRenderer.cpp
     src/CodexUsageFetcher.cpp
     src/ClaudeUsageFetcher.cpp
     src/ClaudeCredentialReader.cpp
@@ -89,6 +90,8 @@ target_link_libraries(AIUsage PRIVATE
     crypt32
     bcrypt
     gdiplus
+    d2d1
+    dwrite
 )
 
 set_target_properties(AIUsage PROPERTIES

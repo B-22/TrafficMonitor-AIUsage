@@ -1,6 +1,7 @@
 #include "CodexUsageFetcher.h"
 #include "ClaudeUsageFetcher.h"
 #include "CodexUsageVersion.h"
+#include "DashboardRenderer.h"
 #include "ProxyHelper.h"
 
 #include "PluginInterface.h"
@@ -11,12 +12,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <cwctype>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -26,93 +30,243 @@
 namespace {
 
 // =====================================================================
-// Layout metrics — exact values from design/preview_v03.html
+// Layout metrics.
+//
+// docs/design/taskbar_preview.html draws the reference on a 50 px canvas,
+// but TrafficMonitor hard-codes its taskbar window height:
+//
+//     TaskBarDlg.h:  #define TASKBAR_WND_HEIGHT DPI(32)
+//
+// CalculateWindowSize() assigns that constant directly, so the slot is 32
+// logical px regardless of taskbar height, font size or vertical margin, and
+// PluginInterface.h offers no way for a plugin to ask for more. Anchoring the
+// vertical layout to a fixed 50 px frame therefore pushed the "5h"/"7d"
+// corner tags above the top edge and the provider captions below the bottom
+// edge, where the host clipped both away. Every vertical position below is
+// derived from the slot the host actually hands us instead.
 // =====================================================================
+namespace TaskbarVisualSpec {
+constexpr float kHostSlotHeight = 32.0f;  // TASKBAR_WND_HEIGHT, logical px
+constexpr float kPluginPadLeft = 10.0f;
+constexpr float kRingGap = 6.0f;
+constexpr float kProviderGroupGap = 11.0f;
+constexpr float kInfoDividerMargin = 5.0f;
+constexpr float kInfoGap = 11.0f;
+constexpr float kMaxRingBox = 28.0f;      // ring box of the 50 px reference
+constexpr float kTagFont = 7.0f;
+constexpr float kProviderFont = 6.5f;
+constexpr float kInfoLabelFont = 8.0f;
+constexpr float kInfoValueFont = 11.0f;
+constexpr float kInfoSubFont = 6.5f;
+constexpr float kRingStrokeRatio = 2.2f / 28.0f;
+constexpr float kNumberRatio = 0.45f;     // ring number vs. ring box
+constexpr float kBottomInset = 1.0f;
+}  // namespace TaskbarVisualSpec
+
+// Horizontal metrics only. Vertical positions live in DashLayout because they
+// depend on the slot height and on real font metrics.
 struct LM {
     int padX;            // 10px
-    int padRight;        // 2px
-    int ringD;           // 24px
-    int ringStroke;      // 2.5px → 3px integer
-    int ringGap;         // 6px
-    int ringGroupGap;    // 4px (Claude/Codex separator margin)
-    int ringGroupSepH;   // 18px
-    int pctNumSize;      // 9px
-    int pctSignSize;     // 5.5px → 6px
-    int labelSize;       // 6px
-    int labelOffsetX;    // -4px from ring right edge
-    int labelOffsetY;    // 0px from ring top
-    int sepW;            // 1px
-    int sepH;            // 20px
-    int sepMargin;       // 8px each side
-    int infoGap;         // 12px
-    int infoYOffset;     // -2px
-    int infoPadTop;      // 4px
-    int infoLabelSize;   // 7px
-    int infoValueSize;   // 9.5px → 10px
-    int infoSubSize;     // 6.5px → 7px
+    int padRight;        // 0px
+    int ringGap;         // 6px within a provider pair
+    int ringGroupGap;    // 11px between Claude and Codex pairs
+    int sepMargin;       // 5px each side of the info divider
+    int infoGap;         // 11px between info blocks
     int dotSize;         // 5px
     int dotGap;          // 3px
-    int statusSize;      // 8px
-    int staleSize;       // 8px
 };
 
 LM GetMetrics(int dpi) {
     float s = dpi / 96.0f;
     LM m{};
-    m.padX          = (int)(10 * s);
-    m.padRight      = std::max(1, (int)roundf(2.0f * s));
-    m.ringD         = (int)(24 * s);
-    m.ringStroke    = std::max(2, (int)roundf(2.5f * s));
-    m.ringGap       = (int)(8 * s);
-    m.ringGroupGap  = (int)(4 * s);
-    m.ringGroupSepH = (int)(18 * s);
-    m.pctNumSize    = std::max(7, (int)(9 * s));
-    m.pctSignSize   = std::max(5, (int)roundf(5.5f * s));
-    m.labelSize     = std::max(5, (int)(6 * s));
-    m.labelOffsetX  = (int)(-2 * s);
-    m.labelOffsetY  = 0;
-    m.sepW          = 1;
-    m.sepH          = (int)(20 * s);
-    m.sepMargin     = (int)(8 * s);
-    m.infoGap       = (int)(12 * s);
-    m.infoYOffset   = (int)roundf(-2.0f * s);
-    m.infoPadTop    = (int)(4 * s);
-    m.infoLabelSize = std::max(6, (int)(7 * s));
-    m.infoValueSize = std::max(8, (int)roundf(9.5f * s));
-    m.infoSubSize   = std::max(5, (int)roundf(6.5f * s));
-    m.dotSize       = (int)(5 * s);
-    m.dotGap        = (int)(3 * s);
-    m.statusSize    = std::max(7, (int)(8 * s));
-    m.staleSize     = std::max(7, (int)(8 * s));
+    m.padX          = (int)roundf(TaskbarVisualSpec::kPluginPadLeft * s);
+    m.padRight      = 0;
+    m.ringGap       = std::max(
+        4, (int)roundf(TaskbarVisualSpec::kRingGap * s));
+    m.ringGroupGap  = std::max(
+        8, (int)roundf(TaskbarVisualSpec::kProviderGroupGap * s));
+    m.sepMargin     = std::max(
+        4, (int)roundf(TaskbarVisualSpec::kInfoDividerMargin * s));
+    m.infoGap       = std::max(
+        8, (int)roundf(TaskbarVisualSpec::kInfoGap * s));
+    m.dotSize       = std::max(4, (int)roundf(5.0f * s));
+    m.dotGap        = std::max(2, (int)roundf(3.0f * s));
     return m;
 }
 
-// =====================================================================
-// Colors — from preview_v03.css
-// =====================================================================
-constexpr COLORREF RING_TRACK    = RGB(40, 55, 72);    // rgba(255,255,255,0.08) on #1C2B3F
-constexpr COLORREF CLAUDE_CLR    = RGB(198, 108, 50);   // #c66c32
-constexpr COLORREF CODEX_CLR     = RGB(46, 168, 177);   // #2ea8b1
-constexpr COLORREF TEXT_PCT      = RGB(242, 242, 242);  // #f2f2f2
-constexpr COLORREF TEXT_LABEL    = RGB(192, 192, 196);  // #c0c0c4  (ring label + info label + status)
-constexpr COLORREF TEXT_DIM      = RGB(124, 124, 127);  // ring label fallback
-constexpr COLORREF TEXT_VALUE    = RGB(240, 240, 242);  // #f0f0f2
-constexpr COLORREF SEP_COLOR     = RGB(31, 31, 31);     // rgba(255,255,255,0.12) on dark
-constexpr COLORREF DOT_RED       = RGB(220, 60, 60);    // #dc3c3c
-constexpr COLORREF DOT_GREEN     = RGB(46, 168, 74);    // #2ea84a
-constexpr COLORREF DOT_YELLOW    = RGB(224, 170, 45);   // source data is 1-5 minutes old
-constexpr COLORREF RING_NO_DATA  = RGB(60, 60, 63);
+// Vertical layout derived from the slot the host hands us.
+//
+// The corner tags own the band between the top of the slot and their own
+// baseline: "5h" and "7d" have no descenders, so all of their ink fits there
+// and the gauges can start immediately below without any clipping.
+struct DashLayout {
+    float slotTop = 0.0f;
+    float slotHeight = 0.0f;
+    float tagFont = 7.0f;
+    float tagTop = 0.0f;          // text layout box top
+    float ringBox = 24.0f;        // also the horizontal cell width
+    float ringStroke = 2.2f;
+    float ringRadius = 11.0f;
+    float ringCenterY = 0.0f;
+    float numberFont = 11.0f;
+    bool showProviderLabel = false;
+    float providerFont = 6.5f;
+    float providerTop = 0.0f;
+    float dividerTop = 0.0f;
+    float dividerBottom = 0.0f;
+    float infoLabelFont = 8.0f;
+    float infoLabelCenterY = 0.0f;
+    float infoValueFont = 11.0f;
+    float infoValueCenterY = 0.0f;
+    float infoSubFont = 6.5f;
+};
 
-Gdiplus::Color ToGdiColor(COLORREF color) {
-    return Gdiplus::Color(
-        255, GetRValue(color), GetGValue(color), GetBValue(color));
+DashLayout ComputeLayout(
+    HDC hdc,
+    const wchar_t* fontFamily,
+    int dpi,
+    float slotTop,
+    float slotHeight) {
+    const float s = dpi / 96.0f;
+    DashLayout layout;
+    layout.slotTop = slotTop;
+    layout.slotHeight = std::max(16.0f * s, slotHeight);
+
+    layout.tagFont = std::clamp(
+        TaskbarVisualSpec::kTagFont * s,
+        6.0f * s,
+        layout.slotHeight * 0.26f);
+    layout.tagTop = slotTop;
+    const float tagBand = DashboardRenderer::MeasureBaseline(
+        hdc, fontFamily, layout.tagFont, false);
+
+    const float bottomInset = TaskbarVisualSpec::kBottomInset * s;
+    float ringSpace = layout.slotHeight - tagBand - bottomInset;
+
+    // The provider caption under each pair needs a taller slot than
+    // TrafficMonitor provides. Keep the gauges legible rather than shrinking
+    // them to squeeze it in; the info strip already carries Claude / Codex
+    // columns, and the group divider separates the two pairs.
+    layout.providerFont = TaskbarVisualSpec::kProviderFont * s;
+    const float providerBand = DashboardRenderer::MeasureLineHeight(
+        hdc, fontFamily, layout.providerFont, false);
+    layout.showProviderLabel =
+        ringSpace - providerBand >= TaskbarVisualSpec::kMaxRingBox * s * 0.9f;
+    if (layout.showProviderLabel) {
+        ringSpace -= providerBand;
+    }
+
+    layout.ringBox = std::min(
+        ringSpace, TaskbarVisualSpec::kMaxRingBox * s);
+    layout.ringStroke = std::max(
+        2.0f, layout.ringBox * TaskbarVisualSpec::kRingStrokeRatio);
+    layout.ringRadius =
+        layout.ringBox / 2.0f - layout.ringStroke / 2.0f;
+    layout.ringCenterY = slotTop + tagBand + layout.ringBox / 2.0f;
+    layout.numberFont = std::max(
+        8.0f, layout.ringBox * TaskbarVisualSpec::kNumberRatio);
+    layout.providerTop = slotTop + tagBand + layout.ringBox;
+
+    layout.dividerTop = slotTop + layout.slotHeight * 0.14f;
+    layout.dividerBottom = slotTop + layout.slotHeight * 0.90f;
+
+    layout.infoLabelFont = std::max(
+        7.0f, TaskbarVisualSpec::kInfoLabelFont * s);
+    layout.infoValueFont = std::max(
+        9.0f, TaskbarVisualSpec::kInfoValueFont * s);
+    layout.infoSubFont = std::max(
+        5.0f, TaskbarVisualSpec::kInfoSubFont * s);
+    layout.infoLabelCenterY = slotTop + layout.slotHeight * 0.225f;
+    layout.infoValueCenterY = slotTop + layout.slotHeight * 0.725f;
+    return layout;
 }
 
-COLORREF GaugeColor(int pct, bool isClaude) {
-    if (pct < 0) return RING_NO_DATA;
-    if (pct < 60) return isClaude ? CLAUDE_CLR : CODEX_CLR;
-    if (pct < 85) return RGB(220, 150, 40);
-    return RGB(220, 60, 60);
+// =====================================================================
+// Colors
+// =====================================================================
+struct DashboardPalette {
+    COLORREF ringTrack;
+    COLORREF normal;
+    COLORREF warning;
+    COLORREF elevated;
+    COLORREF danger;
+    COLORREF textPct;
+    COLORREF textLabel;
+    COLORREF textDim;
+    COLORREF textValue;
+    COLORREF separator;
+    COLORREF dotRed;
+    COLORREF dotGreen;
+    COLORREF dotYellow;
+    COLORREF ringNoData;
+};
+
+DashboardPalette ResolveDashboardPalette(
+    bool dark,
+    const std::optional<COLORREF>& hostLabelColor,
+    const std::optional<COLORREF>& hostValueColor) {
+    DashboardPalette palette = dark
+        ? DashboardPalette{
+            RGB(72, 80, 92), RGB(46, 168, 120),
+            RGB(224, 170, 45), RGB(220, 120, 40), RGB(220, 60, 60),
+            RGB(242, 242, 242), RGB(203, 204, 208), RGB(150, 151, 155),
+            RGB(240, 240, 242), RGB(84, 88, 95),
+            RGB(220, 60, 60), RGB(46, 168, 74), RGB(224, 170, 45),
+            RGB(60, 60, 63)}
+        // The reference mock sits on a #f6f6f6 page, but the plugin never
+        // paints on that: TrafficMonitor keys its configured background out
+        // of the layered taskbar window, so the pixels behind the gauges are
+        // the Windows 11 taskbar itself (measured ~RGB(240, 242, 244) in
+        // light mode). The mock's #e6e6e6 track was only ~10 levels away from
+        // that and read as invisible, so the track and divider are darker
+        // here than in the HTML reference. Secondary text is darkened for the
+        // same reason: at 7-8 px it never reaches full coverage, so a mid
+        // grey washes out completely.
+        : DashboardPalette{
+            RGB(203, 206, 210), RGB(100, 202, 120),
+            RGB(238, 134, 62), RGB(221, 81, 16), RGB(223, 61, 69),
+            RGB(26, 28, 31), RGB(66, 68, 72), RGB(100, 102, 106),
+            RGB(26, 28, 31), RGB(193, 196, 200),
+            RGB(223, 61, 69), RGB(100, 202, 120), RGB(238, 134, 62),
+            RGB(216, 218, 220)};
+
+    // TrafficMonitor already resolves the active taskbar preset, including
+    // per-item colors and automatic Windows light/dark switching. Prefer
+    // those colors when the host provides them; the palette remains the
+    // fallback for older hosts and for non-text dashboard elements.
+    // Keep secondary text intentionally quieter than values. TrafficMonitor
+    // presets often provide the same dark color for both, which makes this
+    // compact two-line layout look heavier than the approved mockup.
+    (void)hostLabelColor;
+    if (hostValueColor) {
+        palette.textPct = *hostValueColor;
+        palette.textValue = *hostValueColor;
+    }
+    return palette;
+}
+
+COLORREF GaugeColor(int pct, const DashboardPalette& palette) {
+    if (pct < 0) return palette.ringNoData;
+    if (pct < 60) return palette.normal;
+    if (pct < 80) return palette.warning;
+    if (pct < 90) return palette.elevated;
+    return palette.danger;
+}
+
+std::optional<COLORREF> ParseHostColor(const wchar_t* data) {
+    if (!data) return std::nullopt;
+    while (iswspace(*data)) ++data;
+    if (*data == L'\0' || *data == L'-') return std::nullopt;
+
+    errno = 0;
+    wchar_t* end = nullptr;
+    const unsigned long value = std::wcstoul(data, &end, 10);
+    if (errno == ERANGE || end == data || value > 0x00FFFFFFUL) {
+        return std::nullopt;
+    }
+    while (end && iswspace(*end)) ++end;
+    if (!end || *end != L'\0') return std::nullopt;
+    return static_cast<COLORREF>(value);
 }
 
 // =====================================================================
@@ -204,6 +358,15 @@ std::wstring UnixToWeekday(long long unixSec) {
     return weekdays[local.wDayOfWeek];
 }
 
+std::wstring UnixToLocalDateTimeW(long long unixSec) {
+    SYSTEMTIME local{};
+    if (!UnixToLocalSystemTime(unixSec, &local)) return L"--";
+    wchar_t buffer[48];
+    swprintf_s(buffer, L"%04d-%02d-%02d %02d:%02d",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
+    return buffer;
+}
+
 // =====================================================================
 // GDI+ init
 // =====================================================================
@@ -215,96 +378,6 @@ void InitGdiplus() {
 }
 void ShutdownGdiplus() {
     if (g_gdiToken) { Gdiplus::GdiplusShutdown(g_gdiToken); g_gdiToken = 0; }
-}
-
-// =====================================================================
-// Drawing primitives (exact mapping from HTML/SVG)
-// =====================================================================
-void DrawArc(Gdiplus::Graphics& g, int cx, int cy, int r, int stroke,
-             int pct, COLORREF track, COLORREF fill) {
-    float R = (float)r, SW = (float)stroke;
-    float L = cx - R, T = cy - R, D = R * 2;
-    Gdiplus::Pen tp(Gdiplus::Color(255, GetRValue(track), GetGValue(track), GetBValue(track)), SW);
-    tp.SetStartCap(Gdiplus::LineCapRound);
-    tp.SetEndCap(Gdiplus::LineCapRound);
-    g.DrawArc(&tp, L, T, D, D, 0, 360);
-    if (pct > 0 && pct <= 100) {
-        Gdiplus::Pen fp(Gdiplus::Color(255, GetRValue(fill), GetGValue(fill), GetBValue(fill)), SW);
-        fp.SetStartCap(Gdiplus::LineCapRound);
-        fp.SetEndCap(Gdiplus::LineCapRound);
-        g.DrawArc(&fp, L, T, D, D, -90, pct * 3.6f);
-    }
-}
-
-void DrawTextAt(Gdiplus::Graphics& g, const wchar_t* txt, float x, float y,
-                const wchar_t* ff, float sz, Gdiplus::Color c, bool bold,
-                Gdiplus::StringAlignment halign = Gdiplus::StringAlignmentNear) {
-    HDC hdc = g.GetHDC();
-    HFONT hFont = CreateFontW(-(int)sz, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL,
-        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, ff);
-    HFONT oldFont = (HFONT)SelectObject(hdc, hFont);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(c.GetR(), c.GetG(), c.GetB()));
-    RECT rc = { (int)x, (int)y, (int)x + 400, (int)y + (int)sz + 8 };
-    DrawTextW(hdc, txt, -1, &rc, DT_LEFT | DT_TOP | DT_NOCLIP | DT_SINGLELINE);
-    SelectObject(hdc, oldFont);
-    DeleteObject(hFont);
-    g.ReleaseHDC(hdc);
-}
-
-void DrawTextCentered(Gdiplus::Graphics& g, const wchar_t* txt, int cx, int cy,
-                      const wchar_t* ff, float sz, Gdiplus::Color c, bool bold) {
-    HDC hdc = g.GetHDC();
-    HFONT hFont = CreateFontW(-(int)sz, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL,
-        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, ff);
-    HFONT oldFont = (HFONT)SelectObject(hdc, hFont);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(c.GetR(), c.GetG(), c.GetB()));
-    SIZE textSize{};
-    GetTextExtentPoint32W(hdc, txt, (int)wcslen(txt), &textSize);
-    int dx = cx - textSize.cx / 2;
-    int dy = cy - (int)sz / 2;
-    RECT rc = { dx, dy, dx + textSize.cx + 4, dy + (int)sz + 4 };
-    DrawTextW(hdc, txt, -1, &rc, DT_LEFT | DT_TOP | DT_NOCLIP | DT_SINGLELINE);
-    SelectObject(hdc, oldFont);
-    DeleteObject(hFont);
-    g.ReleaseHDC(hdc);
-}
-
-int TextWidth(Gdiplus::Graphics& g, const wchar_t* txt, const wchar_t* ff, float sz, bool bold) {
-    HDC hdc = g.GetHDC();
-    HFONT hFont = CreateFontW(-(int)sz, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL,
-        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, ff);
-    HFONT oldFont = (HFONT)SelectObject(hdc, hFont);
-    SIZE textSize{};
-    GetTextExtentPoint32W(hdc, txt, (int)wcslen(txt), &textSize);
-    SelectObject(hdc, oldFont);
-    DeleteObject(hFont);
-    g.ReleaseHDC(hdc);
-    return textSize.cx;
-}
-
-void DrawLine(Gdiplus::Graphics& g, int x, int y1, int y2, COLORREF c) {
-    Gdiplus::Pen p(Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)), 1.0f);
-    g.DrawLine(&p, (float)x, (float)y1, (float)x, (float)y2);
-}
-
-void DrawFreshnessUnderline(Gdiplus::Graphics& g, int centerX, int y, COLORREF c, int dpi) {
-    const int halfWidth = std::max(3, static_cast<int>(roundf(4.0f * dpi / 96.0f)));
-    const float stroke = std::max(1.0f, 1.5f * dpi / 96.0f);
-    Gdiplus::Pen p(ToGdiColor(c), stroke);
-    p.SetStartCap(Gdiplus::LineCapRound);
-    p.SetEndCap(Gdiplus::LineCapRound);
-    g.DrawLine(&p, static_cast<float>(centerX - halfWidth), static_cast<float>(y),
-               static_cast<float>(centerX + halfWidth), static_cast<float>(y));
-}
-
-void DrawDot(Gdiplus::Graphics& g, int x, int y, int r, COLORREF c) {
-    Gdiplus::SolidBrush b(Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)));
-    g.FillEllipse(&b, x - r, y - r, r * 2, r * 2);
 }
 
 // =====================================================================
@@ -320,7 +393,12 @@ struct PluginOptions {
     bool showClaude7dReset = true;  // show Claude 7d reset weekday
     bool showCodex7dReset = true;   // show Codex 7d reset weekday
     bool show7dCountdown = true;    // show the nearest 7d reset
+    bool showResetCreditWarning = true;
+    bool showResetRadar = true;
     int countdownShowBeforeHours = 24;
+    int resetCreditWarningHours = 48;
+    int resetRadarRefreshMinutes = 15;
+    int resetTodayRefreshMinutes = 60;
     std::string customSubExpiry;
 };
 
@@ -328,7 +406,7 @@ struct PluginOptions {
 // Snapshot
 // =====================================================================
 struct DashData {
-    int c5 = -1, c7 = -1, x7 = -1;
+    int c5 = -1, c7 = -1, x5 = -1, x7 = -1;
     std::string c5Reset;
     std::string c7Reset;
     long long x7ResetUnix = 0;   // Codex 7d reset unix timestamp
@@ -341,6 +419,13 @@ struct DashData {
     bool claudeAvailable = false;
     bool codexAvailable = false;
     bool refreshInProgress = false;
+    bool resetCreditsAvailable = false;
+    int resetCreditCount = 0;
+    long long resetCreditExpiryUnix = 0;
+    bool resetRadarWindowOpen = false;
+    int resetProbability24h = -1;
+    int resetProbability48h = -1;
+    long long resetRadarUpdatedUnix = 0;
 };
 
 std::wstring FormatCredits(const DashData& data) {
@@ -374,10 +459,14 @@ FreshnessLevel DisplayFreshness(bool available, double lastSuccess, bool refresh
         SourceAge(available, lastSuccess), refreshInProgress);
 }
 
-COLORREF FreshnessMarkerColor(bool available, double lastSuccess, bool refreshInProgress) {
+COLORREF FreshnessMarkerColor(
+    bool available,
+    double lastSuccess,
+    bool refreshInProgress,
+    const DashboardPalette& palette) {
     const FreshnessLevel level = DisplayFreshness(available, lastSuccess, refreshInProgress);
-    if (level == FreshnessLevel::Warning) return DOT_YELLOW;
-    if (level == FreshnessLevel::Stale) return DOT_RED;
+    if (level == FreshnessLevel::Warning) return palette.dotYellow;
+    if (level == FreshnessLevel::Stale) return palette.dotRed;
     return 0;
 }
 
@@ -414,6 +503,41 @@ std::wstring BuildFreshnessText(const DashData& data) {
     return claude + L" " + codex;
 }
 
+struct CodexColumnDisplay {
+    std::wstring value;
+    bool gradient = false;
+};
+
+CodexColumnDisplay BuildCodexColumnDisplay(
+    const DashData& data,
+    const PluginOptions& options) {
+    CodexColumnDisplay display;
+    const long long now = static_cast<long long>(time(nullptr));
+    if (options.showResetCreditWarning
+        && data.resetCreditsAvailable
+        && data.resetCreditCount > 0
+        && data.resetCreditExpiryUnix > now
+        && data.resetCreditExpiryUnix - now
+            <= static_cast<long long>(options.resetCreditWarningHours) * 60 * 60) {
+        display.value = FormatResetCreditWarning(
+            data.resetCreditCount, data.resetCreditExpiryUnix - now);
+        display.gradient = !display.value.empty();
+        if (display.gradient) return display;
+    }
+    if (options.show7dCountdown) {
+        display.value = Format7dCountdown(
+            {}, data.x7ResetUnix, options.countdownShowBeforeHours);
+    }
+    if (display.value.empty() && options.showStatus) {
+        display.value = FormatFreshnessMinutes(
+            data.codexAvailable, data.lastCodexOk, data.refreshInProgress);
+    }
+    if (display.value.empty()) {
+        display.value = UnixToWeekday(data.x7ResetUnix);
+    }
+    return display;
+}
+
 // =====================================================================
 // Main custom-drawn item
 // =====================================================================
@@ -428,12 +552,15 @@ public:
 
     int GetItemWidth() const override {
         PluginOptions opts;
+        DashData snap;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (cachedW_ > 0) return cachedW_;
             opts = opts_;
+            snap = data_;
         }
-        int width = 124;
+        int width = 162;
+        if (opts.showResetRadar && snap.resetRadarWindowOpen) width += 16;
         bool hasInfoBlock = false;
         const auto addEstimatedBlock = [&](int blockWidth) {
             width += blockWidth;
@@ -449,7 +576,7 @@ public:
         if (opts.showCodex7dReset) {
             addEstimatedBlock(opts.show7dCountdown ? 55 : 45);
         }
-        if (hasInfoBlock) width -= 12;
+        if (hasInfoBlock) width -= 11;
         return width;
     }
 
@@ -467,13 +594,37 @@ public:
             opts = opts_;
         }
 
-        Gdiplus::Graphics g(hdc);
         const wchar_t* ff = L"Segoe UI";
-        int width = m.padX + 3 * (m.ringD + m.ringGap) + 2 * m.sepMargin;
+        // The ring cell is square, so its width follows the same slot height
+        // that DrawItem lays out against. Until the first paint tells us what
+        // the host really passes, assume TASKBAR_WND_HEIGHT.
+        const DashLayout layout = ComputeLayout(
+            hdc, ff, dpi, 0.0f, SlotHeightHint(dpi));
+        const int ringCell = std::max(
+            8, static_cast<int>(std::lround(layout.ringBox)));
+        const auto textWidth = [&](const wchar_t* text,
+                                   const wchar_t* family,
+                                   float size,
+                                   bool medium) {
+            return static_cast<int>(std::ceil(
+                DashboardRenderer::MeasureTextWidth(
+                    hdc, text, family, size, medium)));
+        };
+        int width = m.padX
+                  + 4 * ringCell
+                  + 2 * m.ringGap
+                  + m.ringGroupGap
+                  + 2 * m.sepMargin;
+        if (opts.showResetRadar && snap.resetRadarWindowOpen) {
+            width += textWidth(
+                L"\u26A1", L"Segoe UI Symbol",
+                layout.infoValueFont, true)
+                + std::max(3, m.ringGap / 2);
+        }
         bool hasInfoBlock = false;
         const auto addBlock = [&](const wchar_t* label, const std::wstring& value, int valueExtra = 0) {
-            width += std::max(TextWidth(g, label, ff, (float)m.infoLabelSize, false),
-                              TextWidth(g, value.c_str(), ff, (float)m.infoValueSize, true) + valueExtra)
+            width += std::max(textWidth(label, ff, layout.infoLabelFont, false),
+                              textWidth(value.c_str(), ff, layout.infoValueFont, false) + valueExtra)
                    + m.infoGap;
             hasInfoBlock = true;
         };
@@ -508,17 +659,9 @@ public:
             addBlock(L"Claude", value);
         }
         if (opts.showCodex7dReset) {
-            std::wstring value;
-            if (opts.show7dCountdown) {
-                value = Format7dCountdown(
-                    {}, snap.x7ResetUnix, opts.countdownShowBeforeHours);
-            }
-            if (value.empty() && opts.showStatus) {
-                value = FormatFreshnessMinutes(
-                    snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress);
-            }
-            if (value.empty()) value = UnixToWeekday(snap.x7ResetUnix);
-            addBlock(L"Codex", value);
+            const CodexColumnDisplay display =
+                BuildCodexColumnDisplay(snap, opts);
+            addBlock(L"Codex", display.value);
         }
         if (hasInfoBlock) width -= m.infoGap;
         width += m.padRight;
@@ -533,37 +676,95 @@ public:
         HDC hdc = (HDC)hDC;
         if (!hdc) return;
         const int savedDc = SaveDC(hdc);
-        if (w > 0 && h > 0) IntersectClipRect(hdc, x, y, x + w, y + h);
         int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
         if (dpi < 72) dpi = 96;
         LM m = GetMetrics(dpi);
+        RECT renderBounds{
+            x,
+            y,
+            x + std::max(1, w),
+            y + std::max(1, h)};
+        if (w > 0 && h > 0) {
+            // The host can leave an item-sized clip selected on the HDC.
+            // Reset that transient clip and restore one bounded by the item
+            // rectangle itself. Nothing is drawn outside it any more, so the
+            // old vertical overscan only hid layout mistakes: whatever landed
+            // in it was clipped by the 32 px window regardless.
+            SelectClipRgn(hdc, nullptr);
+            IntersectClipRect(
+                hdc,
+                renderBounds.left,
+                renderBounds.top,
+                renderBounds.right,
+                renderBounds.bottom);
+        }
 
         DashData snap;
         PluginOptions opts;
+        std::optional<COLORREF> hostLabelColor;
+        std::optional<COLORREF> hostValueColor;
         {
             std::lock_guard<std::mutex> lk(mu_);
             snap = data_;
             opts = opts_;
+            hostLabelColor = hostLabelColor_;
+            hostValueColor = hostValueColor_;
+        }
+        const DashboardPalette colors =
+            ResolveDashboardPalette(dark, hostLabelColor, hostValueColor);
+
+        // Draw directly through Direct2D/DirectWrite at the final taskbar
+        // scale. The renderer falls back to GDI/GDI+ when unavailable.
+        DashboardRenderer canvas(hdc, renderBounds, dpi);
+        const wchar_t* ff = L"Segoe UI";
+        const float visualScale = dpi / 96.0f;
+        const DashLayout layout = ComputeLayout(
+            hdc,
+            ff,
+            dpi,
+            static_cast<float>(y),
+            static_cast<float>(std::max(1, h)));
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (slotHeight_ != layout.slotHeight) {
+                slotHeight_ = layout.slotHeight;
+                cachedW_ = 0;
+            }
+        }
+        const int ringCell = std::max(
+            8, static_cast<int>(std::lround(layout.ringBox)));
+        int curX = x + m.padX;
+        const COLORREF cPct = colors.textPct;
+        const COLORREF cLabel = colors.textLabel;
+        const COLORREF cValue = colors.textValue;
+
+        if (opts.showResetRadar && snap.resetRadarWindowOpen) {
+            const wchar_t* indicator = L"\u26A1";
+            const int indicatorWidth = static_cast<int>(std::ceil(
+                canvas.TextWidth(
+                    indicator, L"Segoe UI Symbol",
+                    layout.infoValueFont, true)));
+            canvas.DrawGradientTextAt(
+                indicator,
+                static_cast<float>(curX),
+                layout.infoValueCenterY - layout.infoValueFont * 0.7f,
+                L"Segoe UI Symbol", layout.infoValueFont,
+                true, dark);
+            curX += indicatorWidth + std::max(3, m.ringGap / 2);
         }
 
-        // Transparent background — taskbar shows through
-        Gdiplus::Graphics g(hdc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-
-        const wchar_t* ff = L"Segoe UI";
-        int cy = y + h / 2;
-        int curX = x + m.padX;
-        Gdiplus::Color cPct = ToGdiColor(TEXT_PCT);
-        Gdiplus::Color cLabel = ToGdiColor(TEXT_LABEL);
-        Gdiplus::Color cValue = ToGdiColor(TEXT_VALUE);
-
         // ── Ring gauges ──
-        auto ring = [&](int pct, COLORREF clr, const wchar_t* tag, COLORREF freshnessMarker = 0) {
-            int rcx = curX + m.ringD / 2;
-            int R = m.ringD / 2 - m.ringStroke;
-            DrawArc(g, rcx, cy, R, m.ringStroke, std::max(0, pct), RING_TRACK,
-                    pct < 0 ? RING_NO_DATA : clr);
+        auto ring = [&](int pct, COLORREF clr, const wchar_t* tag,
+                        COLORREF freshnessMarker, int trailingGap) {
+            const float rcx = curX + ringCell / 2.0f;
+            canvas.DrawArc(
+                rcx,
+                layout.ringCenterY,
+                layout.ringRadius,
+                layout.ringStroke,
+                std::max(0, pct),
+                colors.ringTrack,
+                pct < 0 ? colors.ringNoData : clr);
 
             if (pct >= 0) {
                 wchar_t nb[8];
@@ -571,59 +772,172 @@ public:
                     swprintf_s(nb, L"%d%%", pct);
                 else
                     swprintf_s(nb, L"%d", pct);
-                DrawTextCentered(g, nb, rcx, cy - 2, ff, (float)m.pctNumSize, cPct, true);
+                canvas.DrawTextCentered(
+                    nb,
+                    rcx,
+                    layout.ringCenterY,
+                    ff,
+                    layout.numberFont,
+                    cPct,
+                    false);
             } else {
-                DrawTextCentered(g, L"--", rcx, cy - 2, ff, (float)m.pctNumSize,
-                                 Gdiplus::Color(100, 100, 103), false);
+                canvas.DrawTextCentered(
+                    L"--",
+                    rcx,
+                    layout.ringCenterY,
+                    ff,
+                    layout.numberFont,
+                    colors.textDim,
+                    false);
             }
 
-            // Label top-right, outside ring
-            float lx = (float)(curX + m.ringD + m.labelOffsetX);
-            float ly = (float)(cy - m.ringD / 2 + m.labelOffsetY);
-            DrawTextAt(g, tag, lx, ly, ff, (float)m.labelSize,
-                       Gdiplus::Color(178, 178, 178), true);
+            // The tag lives in the band above the gauges, right-aligned to its
+            // own cell so it reads as that ring's corner label and leans into
+            // the gap before the next one. "5h" and "7d" have no descenders,
+            // so the band down to the tag baseline holds all of their ink.
+            const float tagWidth =
+                canvas.TextWidth(tag, ff, layout.tagFont, false);
+            const float tagLeft = std::max(
+                static_cast<float>(curX),
+                curX + ringCell - tagWidth + trailingGap / 2.0f);
+            canvas.DrawTextAt(
+                tag,
+                tagLeft,
+                layout.tagTop,
+                ff,
+                layout.tagFont,
+                cLabel,
+                false);
             if (opts.showStatus && freshnessMarker != 0) {
-                DrawFreshnessUnderline(
-                    g, rcx, cy + m.pctNumSize / 2 + std::max(2, dpi / 48),
-                    freshnessMarker, dpi);
+                canvas.DrawFreshnessUnderline(
+                    rcx,
+                    layout.ringCenterY + layout.numberFont / 2.0f
+                        + std::max(1.5f, visualScale * 1.5f),
+                    freshnessMarker,
+                    dpi);
             }
-            curX += m.ringD + m.ringGap;
+            curX += ringCell + trailingGap;
+            return static_cast<int>(std::lround(rcx));
+        };
+        auto providerLabel = [&](const wchar_t* text, int firstCenter, int secondCenter) {
+            // Only drawn when the slot is tall enough to carry the caption
+            // without shrinking the gauges. TrafficMonitor's 32 px window is
+            // not, so this stays off there and the info strip's Claude /
+            // Codex columns plus the group divider carry the distinction.
+            if (!layout.showProviderLabel) return;
+            const int center = (firstCenter + secondCenter) / 2;
+            const float textW =
+                canvas.TextWidth(text, ff, layout.providerFont, false);
+            canvas.DrawTextAt(
+                text,
+                center - textW / 2.0f,
+                layout.providerTop,
+                ff,
+                layout.providerFont,
+                colors.textDim,
+                false);
         };
 
         const COLORREF claudeFreshness = FreshnessMarkerColor(
-            snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress);
+            snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress, colors);
         const COLORREF codexFreshness = FreshnessMarkerColor(
-            snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress);
-        ring(snap.c5, GaugeColor(snap.c5, true), L"5h", claudeFreshness);
-        ring(snap.c7, GaugeColor(snap.c7, true), L"7d", claudeFreshness);
-        ring(snap.x7, GaugeColor(snap.x7, false), L"7d", codexFreshness);
+            snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress, colors);
+        const int claude5Center = ring(
+            snap.c5, GaugeColor(snap.c5, colors), L"5h",
+            claudeFreshness, m.ringGap);
+        const int claude7Center = ring(
+            snap.c7, GaugeColor(snap.c7, colors), L"7d",
+            claudeFreshness, 0);
+        providerLabel(L"Claude", claude5Center, claude7Center);
+
+        const int groupSeparatorX = curX + m.ringGroupGap / 2;
+        canvas.DrawLine(
+            static_cast<float>(groupSeparatorX),
+            layout.dividerTop,
+            static_cast<float>(groupSeparatorX),
+            layout.dividerBottom,
+            colors.separator);
+        curX += m.ringGroupGap;
+
+        const int codex5Center = ring(
+            snap.x5, GaugeColor(snap.x5, colors), L"5h",
+            codexFreshness, m.ringGap);
+        const int codex7Center = ring(
+            snap.x7, GaugeColor(snap.x7, colors), L"7d",
+            codexFreshness, 0);
+        providerLabel(L"Codex", codex5Center, codex7Center);
 
         // ── Separator 1 ──
         curX += m.sepMargin;
-        DrawLine(g, curX, cy - m.sepH / 2, cy + m.sepH / 2, SEP_COLOR);
+        canvas.DrawLine(
+            static_cast<float>(curX),
+            layout.dividerTop,
+            static_cast<float>(curX),
+            layout.dividerBottom,
+            colors.separator);
         curX += m.sepMargin;
 
         // ── Info blocks ──
+        // Both rows are centred on their band instead of stacked from a fixed
+        // top, so the pair stays balanced whatever height the host gives us.
+        const auto lineTopFor = [&](float centerY, float font, bool medium) {
+            return centerY - DashboardRenderer::MeasureLineHeight(
+                hdc, ff, font, medium) / 2.0f;
+        };
         auto block = [&](const wchar_t* label, const wchar_t* value,
-                         const wchar_t* sub = nullptr, COLORREF subClr = TEXT_LABEL) {
-            const int labelW = TextWidth(g, label, ff, (float)m.infoLabelSize, false);
-            const int valueW = TextWidth(g, value, ff, (float)m.infoValueSize, true);
-            const int subW = sub ? TextWidth(g, sub, ff, (float)m.infoSubSize, false) : 0;
-            const int bw = std::max({labelW, valueW, subW});
-            const int totalH = m.infoLabelSize + 3 + m.infoValueSize
-                             + (sub ? 2 + m.infoSubSize : 0);
-            const int by = cy - totalH / 2 + m.infoYOffset;
-            const int valueY = by + m.infoLabelSize + 3;
-            DrawTextAt(g, label, (float)(curX + (bw - labelW) / 2), (float)by,
-                       ff, (float)m.infoLabelSize, cLabel, false);
-            DrawTextAt(g, value, (float)(curX + (bw - valueW) / 2), (float)valueY,
-                       ff, (float)m.infoValueSize, cValue, true);
-            if (sub) {
-                DrawTextAt(g, sub, (float)(curX + (bw - subW) / 2),
-                           (float)(valueY + m.infoValueSize + 2),
-                           ff, (float)m.infoSubSize, Gdiplus::Color(GetRValue(subClr), GetGValue(subClr), GetBValue(subClr)), false);
+                         const wchar_t* sub = nullptr, COLORREF subClr = 0,
+                         bool gradientValue = false) {
+            const float labelW =
+                canvas.TextWidth(label, ff, layout.infoLabelFont, false);
+            const float valueW =
+                canvas.TextWidth(value, ff, layout.infoValueFont, false);
+            const float subW =
+                sub ? canvas.TextWidth(sub, ff, layout.infoSubFont, false)
+                    : 0.0f;
+            const float bw = std::max({labelW, valueW, subW});
+            canvas.DrawTextCentered(
+                label,
+                curX + bw / 2.0f,
+                layout.infoLabelCenterY,
+                ff,
+                layout.infoLabelFont,
+                cLabel,
+                false);
+            if (gradientValue) {
+                canvas.DrawGradientTextAt(
+                    value,
+                    curX + (bw - valueW) / 2.0f,
+                    lineTopFor(layout.infoValueCenterY,
+                               layout.infoValueFont, true),
+                    ff,
+                    layout.infoValueFont,
+                    true,
+                    dark);
+            } else {
+                canvas.DrawTextCentered(
+                    value,
+                    curX + bw / 2.0f,
+                    layout.infoValueCenterY,
+                    ff,
+                    layout.infoValueFont,
+                    cValue,
+                    false);
             }
-            curX += bw + m.infoGap;
+            if (sub) {
+                const COLORREF resolvedSubColor =
+                    subClr == 0 ? colors.textLabel : subClr;
+                canvas.DrawTextAt(
+                    sub,
+                    curX + (bw - subW) / 2.0f,
+                    lineTopFor(layout.infoValueCenterY,
+                               layout.infoValueFont, false)
+                        + layout.infoValueFont + 2.0f,
+                    ff,
+                    layout.infoSubFont,
+                    resolvedSubColor,
+                    false);
+            }
+            curX += static_cast<int>(std::ceil(bw)) + m.infoGap;
         };
 
         if (opts.showCredits) {
@@ -643,28 +957,44 @@ public:
                             || snap.subStatus == "paused");
             bool isActive = (snap.subStatus == "active" || snap.subStatus == "trialing");
             COLORREF dotClr = 0;
-            if (isCanceled) { dotClr = DOT_RED; }
-            else if (isActive) { dotClr = DOT_GREEN; }
-            const int labelW = TextWidth(
-                g, L"\u8BA2\u9605", ff, (float)m.infoLabelSize, false);
-            const int valueTextW = TextWidth(
-                g, dateStr.c_str(), ff, (float)m.infoValueSize, true);
-            const int valueW = valueTextW + (dotClr ? m.dotSize + m.dotGap : 0);
-            const int bw = std::max(labelW, valueW);
-            const int totalH = m.infoLabelSize + 3 + m.infoValueSize;
-            const int by = cy - totalH / 2 + m.infoYOffset;
-            DrawTextAt(g, L"\u8BA2\u9605", (float)(curX + (bw - labelW) / 2), (float)by, ff,
-                       (float)m.infoLabelSize, cLabel, false);
+            if (isCanceled) { dotClr = colors.dotRed; }
+            else if (isActive) { dotClr = colors.dotGreen; }
+            const float labelW = canvas.TextWidth(
+                L"\u8BA2\u9605", ff, layout.infoLabelFont, false);
+            const float valueTextW = canvas.TextWidth(
+                dateStr.c_str(), ff, layout.infoValueFont, false);
+            const float valueW =
+                valueTextW + (dotClr ? m.dotSize + m.dotGap : 0);
+            const float bw = std::max(labelW, valueW);
+            canvas.DrawTextCentered(
+                L"\u8BA2\u9605",
+                curX + bw / 2.0f,
+                layout.infoLabelCenterY,
+                ff,
+                layout.infoLabelFont,
+                cLabel,
+                false);
             // Value with dot
-            int vx = curX + (bw - valueW) / 2;
-            int vy = by + m.infoLabelSize + 3;
+            float vx = curX + (bw - valueW) / 2.0f;
+            const float vy = lineTopFor(
+                layout.infoValueCenterY, layout.infoValueFont, false);
             if (dotClr) {
-                DrawDot(g, vx + m.dotSize / 2, vy + m.infoValueSize / 2, m.dotSize / 2, dotClr);
+                canvas.DrawDot(
+                    vx + m.dotSize / 2.0f,
+                    layout.infoValueCenterY,
+                    m.dotSize / 2.0f,
+                    dotClr);
                 vx += m.dotSize + m.dotGap;
             }
-            DrawTextAt(g, dateStr.c_str(), (float)vx, (float)vy, ff,
-                       (float)m.infoValueSize, cValue, true);
-            curX += bw + m.infoGap;
+            canvas.DrawTextAt(
+                dateStr.c_str(),
+                vx,
+                vy,
+                ff,
+                layout.infoValueFont,
+                cValue,
+                false);
+            curX += static_cast<int>(std::ceil(bw)) + m.infoGap;
         }
 
         if (opts.showCustomExpiry) {
@@ -687,17 +1017,10 @@ public:
             block(L"Claude", wd.c_str());
         }
         if (opts.showCodex7dReset) {
-            std::wstring wd;
-            if (opts.show7dCountdown) {
-                wd = Format7dCountdown(
-                    {}, snap.x7ResetUnix, opts.countdownShowBeforeHours);
-            }
-            if (wd.empty() && opts.showStatus) {
-                wd = FormatFreshnessMinutes(
-                    snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress);
-            }
-            if (wd.empty()) wd = UnixToWeekday(snap.x7ResetUnix);
-            block(L"Codex", wd.c_str());
+            const CodexColumnDisplay display =
+                BuildCodexColumnDisplay(snap, opts);
+            block(L"Codex", display.value.c_str(), nullptr, colors.textLabel,
+                  display.gradient);
         }
 
         // ── Separator 2 + per-source freshness status ──
@@ -714,14 +1037,35 @@ public:
         opts_ = o;
         cachedW_ = 0;
     }
+    void SetHostLabelColor(COLORREF color) {
+        std::lock_guard<std::mutex> lk(mu_);
+        hostLabelColor_ = color;
+    }
+    void SetHostValueColor(COLORREF color) {
+        std::lock_guard<std::mutex> lk(mu_);
+        hostValueColor_ = color;
+    }
     PluginOptions GetOptions() const { std::lock_guard<std::mutex> lk(mu_); return opts_; }
     DashData GetSnapshot() const { std::lock_guard<std::mutex> lk(mu_); return data_; }
 
 private:
+    // Height of the slot the host draws into. TrafficMonitor always passes
+    // TASKBAR_WND_HEIGHT, but the first width query happens before the first
+    // paint, so fall back to that constant until DrawItem reports the real
+    // rectangle.
+    float SlotHeightHint(int dpi) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (slotHeight_ > 0.0f) return slotHeight_;
+        return TaskbarVisualSpec::kHostSlotHeight * (dpi / 96.0f);
+    }
+
     mutable std::mutex mu_;
     DashData data_;
     PluginOptions opts_;
+    std::optional<COLORREF> hostLabelColor_;
+    std::optional<COLORREF> hostValueColor_;
     mutable int cachedW_ = 0;
+    mutable float slotHeight_ = 0.0f;
 };
 
 // =====================================================================
@@ -764,11 +1108,36 @@ public:
                 d.claudeAvailable = true;
                 d.lastClaudeOk = claude.lastSuccessTime > 0 ? claude.lastSuccessTime : t;
             }
-            if (codex.success && codex.weekly.remainingPercent >= 0 && codex.weekly.remainingPercent <= 100) {
-                d.x7 = 100 - codex.weekly.remainingPercent;
-                d.x7ResetUnix = codex.weekly.resetAtUnixSeconds;
-                d.codexAvailable = true;
-                d.lastCodexOk = t;
+            if (codex.success) {
+                bool hasCodexUsage = false;
+                if (codex.fiveHour.remainingPercent >= 0
+                    && codex.fiveHour.remainingPercent <= 100) {
+                    d.x5 = 100 - codex.fiveHour.remainingPercent;
+                    hasCodexUsage = true;
+                }
+                if (codex.weekly.remainingPercent >= 0
+                    && codex.weekly.remainingPercent <= 100) {
+                    d.x7 = 100 - codex.weekly.remainingPercent;
+                    d.x7ResetUnix = codex.weekly.resetAtUnixSeconds;
+                    hasCodexUsage = true;
+                }
+                if (hasCodexUsage) {
+                    d.codexAvailable = true;
+                    d.lastCodexOk = t;
+                }
+            }
+            if (codex.resetCredits.success) {
+                d.resetCreditsAvailable = true;
+                d.resetCreditCount = codex.resetCredits.availableCount;
+                d.resetCreditExpiryUnix = EarliestAvailableResetCreditExpiry(
+                    codex.resetCredits, static_cast<long long>(t));
+            }
+            if (codex.resetRadar.success) {
+                d.resetRadarWindowOpen = codex.resetRadar.windowOpen;
+                d.resetProbability24h = codex.resetRadar.probability24h;
+                d.resetProbability48h = codex.resetRadar.probability48h;
+                d.resetRadarUpdatedUnix =
+                    codex.resetRadar.updatedAtUnixSeconds;
             }
             d.refreshInProgress = false;
             dash_.SetSnapshot(d);
@@ -852,6 +1221,10 @@ public:
         }
         wchar_t x7ResetBuf[64];
         swprintf_s(x7ResetBuf, L"%lld", snap.x7ResetUnix);
+        const std::wstring resetCreditExpiry =
+            UnixToLocalDateTimeW(snap.resetCreditExpiryUnix);
+        const std::wstring radarUpdated =
+            UnixToLocalDateTimeW(snap.resetRadarUpdatedUnix);
 
         const std::wstring freshness = BuildFreshnessText(snap);
         wchar_t msg[4096];
@@ -869,7 +1242,12 @@ public:
             L"  8. Show Codex Weekday:    %s\n"
             L"  9. Show 7d Countdown:     %s\n"
             L" 10. Countdown Threshold:   %d hours\n"
-            L" 11. Custom Sub Expiry:     %s\n\n"
+            L" 11. Reset Card Warning:    %s\n"
+            L" 12. Card Warning Threshold:%d hours\n"
+            L" 13. Show Reset Radar:      %s\n"
+            L" 14. Forecast Refresh:      %d minutes\n"
+            L" 15. Runway Refresh:        %d minutes\n"
+            L" 16. Custom Sub Expiry:     %s\n\n"
             L"Proxy Settings:\n"
             L"  Proxy Server:   %s\n"
             L"  Require Proxy:  %s\n"
@@ -884,8 +1262,13 @@ public:
             L"  Claude 5h%%:    %d\n"
             L"  Claude 7d%%:    %d\n"
             L"  Claude 7d Reset: %s\n"
+            L"  Codex 5h%%:     %d\n"
             L"  Codex 7d%%:     %d\n"
             L"  Codex 7d Reset:  %s\n"
+            L"  Reset Cards:     %d\n"
+            L"  Card Expiry:     %s\n"
+            L"  Radar Window:    %s\n"
+            L"  Radar Updated:   %s\n"
             L"  Freshness:       %s\n\n"
             L"To change settings, edit AIUsage.ini:\n"
             L"  [AIUsage]\n"
@@ -899,6 +1282,11 @@ public:
             L"  ShowCodex7dReset=1\n"
             L"  Show7dCountdown=1\n"
             L"  CountdownShowBeforeHours=24\n"
+            L"  ShowResetCreditWarning=1\n"
+            L"  ResetCreditWarningHours=48\n"
+            L"  ShowResetRadar=1\n"
+            L"  ResetRadarRefreshMinutes=15\n"
+            L"  RunwayResetRefreshMinutes=60\n"
             L"  CustomSubExpiry=\n"
             L"  ProxyServer=\n"
             L"  RequireProxy=1\n"
@@ -913,6 +1301,11 @@ public:
             o.showCodex7dReset ? L"Yes" : L"No",
             o.show7dCountdown ? L"Yes" : L"No",
             o.countdownShowBeforeHours,
+            o.showResetCreditWarning ? L"Yes" : L"No",
+            o.resetCreditWarningHours,
+            o.showResetRadar ? L"Yes" : L"No",
+            o.resetRadarRefreshMinutes,
+            o.resetTodayRefreshMinutes,
             o.customSubExpiry.empty() ? L"(auto)" : std::wstring(o.customSubExpiry.begin(), o.customSubExpiry.end()).c_str(),
             proxyServer.empty() ? L"(system)" : proxyServer.c_str(),
             requireProxy ? L"Yes" : L"No",
@@ -924,15 +1317,27 @@ public:
             iniActualPath.empty() ? L"(not set)" : iniActualPath.c_str(),
             snap.c5, snap.c7,
             c7ResetBuf,
-            snap.x7,
+            snap.x5, snap.x7,
             x7ResetBuf,
+            snap.resetCreditCount,
+            resetCreditExpiry.c_str(),
+            snap.resetRadarWindowOpen ? L"Open" : L"Closed",
+            radarUpdated.c_str(),
             freshness.empty() ? L"Fresh" : freshness.c_str());
         MessageBoxW(parent, msg, L"AI Usage Options", MB_OK | MB_ICONINFORMATION);
         return OR_OPTION_UNCHANGED;
     }
 
     void OnExtenedInfo(ExtendedInfoIndex idx, const wchar_t* data) override {
-        if (idx == EI_CONFIG_DIR && data) {
+        if (idx == EI_LABEL_TEXT_COLOR) {
+            if (const auto color = ParseHostColor(data)) {
+                dash_.SetHostLabelColor(*color);
+            }
+        } else if (idx == EI_VALUE_TEXT_COLOR) {
+            if (const auto color = ParseHostColor(data)) {
+                dash_.SetHostValueColor(*color);
+            }
+        } else if (idx == EI_CONFIG_DIR && data) {
             std::wstring candidateDir = data;
             std::wstring candidateIni = candidateDir + L"\\AIUsage.ini";
             const DWORD attributes = GetFileAttributesW(candidateIni.c_str());
@@ -1001,10 +1406,36 @@ private:
         GetPrivateProfileStringW(L"AIUsage", L"Show7dCountdown", L"1", buf, 256, iniPath.c_str());
         o.show7dCountdown = (buf[0] == L'1');
 
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowResetCreditWarning", L"1",
+            buf, 256, iniPath.c_str());
+        o.showResetCreditWarning = (buf[0] == L'1');
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowResetRadar", L"1",
+            buf, 256, iniPath.c_str());
+        o.showResetRadar = (buf[0] == L'1');
+
         o.countdownShowBeforeHours = std::clamp(
             static_cast<int>(GetPrivateProfileIntW(
                 L"AIUsage", L"CountdownShowBeforeHours", 24, iniPath.c_str())),
             1, 168);
+
+        o.resetCreditWarningHours = std::clamp(
+            static_cast<int>(GetPrivateProfileIntW(
+                L"AIUsage", L"ResetCreditWarningHours", 48, iniPath.c_str())),
+            1, 168);
+
+        o.resetRadarRefreshMinutes = std::clamp(
+            static_cast<int>(GetPrivateProfileIntW(
+                L"AIUsage", L"ResetRadarRefreshMinutes", 15, iniPath.c_str())),
+            5, 120);
+
+        o.resetTodayRefreshMinutes = std::clamp(
+            static_cast<int>(GetPrivateProfileIntW(
+                L"AIUsage", L"RunwayResetRefreshMinutes", 60,
+                iniPath.c_str())),
+            15, 240);
 
         GetPrivateProfileStringW(
             L"AIUsage", L"CustomSubExpiry", L"", buf, 256, iniPath.c_str());
@@ -1045,21 +1476,16 @@ private:
         proxyConfig_.verifyTargetHost = (buf[0] != L'0');
         claude_.SetProxyConfig(proxyConfig_);
         codex_.SetProxyConfig(proxyConfig_);
+        codex_.SetRadarEnabled(o.showResetRadar);
+        codex_.SetRadarRefreshMinutes(o.resetRadarRefreshMinutes);
+        codex_.SetResetTodayRefreshMinutes(
+            o.resetTodayRefreshMinutes);
     }
 
     std::wstring BuildTip(const ClaudeUsageData& c, const UsageSnapshot& x) const {
-        std::wstring t;
-
-        // Proxy status (always show for user awareness)
-        if (!proxyConfig_.statusMessage.empty()) {
-            t += L"Proxy: ";
-            t += proxyConfig_.statusMessage;
-            t += L"\n";
-        } else if (proxyConfig_.systemProxyDetected) {
-            t += L"Proxy: System proxy detected\n";
-        } else {
-            t += L"Proxy: None (direct/auto)\n";
-        }
+        std::wstring t = L"AI Usage\n";
+        t += L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n";
+        t += L"\u914D\u989D\n";
 
         auto addReset = [&](const std::string& iso) -> std::wstring {
             SYSTEMTIME loc{};
@@ -1069,56 +1495,209 @@ private:
                 loc.wYear, loc.wMonth, loc.wDay, loc.wHour, loc.wMinute);
             return b;
         };
-        if (c.success) {
-            auto line = [&](const wchar_t* n, int pct, const std::string& iso) {
-                t += n; t += L": ";
-                if (pct >= 0) {
-                    t += std::to_wstring(pct) + L"% used";
-                    auto r = addReset(iso);
-                    if (r != L"--") t += L", resets at " + r;
-                } else t += L"--";
-                t += L"\n";
-            };
-            line(L"Claude 5h", c.fiveHourPercent, c.fiveHourResetAt);
-            line(L"Claude 7d", c.sevenDayPercent, c.sevenDayResetAt);
-            if (c.usedCredits > 0) {
-                double a = c.usedCredits / pow(10.0, c.decimalPlaces);
-                wchar_t b[32]; swprintf_s(b, L"Credits: $%.2f\n", a);
-                t += b;
+        auto addQuotaLine = [&](const wchar_t* provider,
+                                const wchar_t* window,
+                                int remaining,
+                                const std::wstring& reset) {
+            t += provider;
+            t += L" \u00B7 ";
+            t += window;
+            t += L"  ";
+            if (remaining >= 0) {
+                t += std::to_wstring(std::clamp(remaining, 0, 100));
+                t += L"% \u5269\u4F59";
+            } else {
+                t += L"--";
             }
-            if (!c.subscriptionStatus.empty()) {
-                t += L"Subscription: " + ToWide(c.subscriptionStatus) + L"\n";
+            if (!reset.empty() && reset != L"--") {
+                t += L"  \u00B7  ";
+                t += reset;
+                t += L" \u91CD\u7F6E";
             }
-            if (!c.errorMessage.empty()) t += L"Claude: " + c.errorMessage + L"\n";
-        } else {
-            t += L"Claude: ";
-            t += c.errorMessage.empty() ? L"waiting" : c.errorMessage;
             t += L"\n";
+        };
+
+        if (c.success) {
+            addQuotaLine(
+                L"Claude", L"5h",
+                c.fiveHourPercent >= 0
+                    ? 100 - c.fiveHourPercent : -1,
+                addReset(c.fiveHourResetAt));
+            addQuotaLine(
+                L"Claude", L"7d",
+                c.sevenDayPercent >= 0
+                    ? 100 - c.sevenDayPercent : -1,
+                addReset(c.sevenDayResetAt));
+        } else {
+            t += L"Claude  --\n";
         }
         if (x.success) {
-            auto cx = [&](const UsageWindow& w, const wchar_t* n, bool date) {
-                if (w.remainingPercent < 0) { t += std::wstring(n) + L": --\n"; return; }
-                t += std::wstring(n) + L": " + std::to_wstring(100 - w.remainingPercent) + L"% used";
-                if (date && w.resetAtUnixSeconds > 0) {
-                    SYSTEMTIME local{};
-                    if (UnixToLocalSystemTime(w.resetAtUnixSeconds, &local)) {
-                        wchar_t b[48];
-                        swprintf_s(b, L", resets at %04d-%02d-%02d %02d:%02d",
-                            local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
-                        t += b;
-                    }
-                } else if (w.resetAfterSeconds > 0) {
-                    wchar_t b[32];
-                    swprintf_s(b, L", in %dh%dm", w.resetAfterSeconds / 3600, (w.resetAfterSeconds % 3600) / 60);
-                    t += b;
+            addQuotaLine(
+                L"Codex", L"5h", x.fiveHour.remainingPercent,
+                x.fiveHour.resetAtUnixSeconds > 0
+                    ? UnixToLocalDateTimeW(
+                        x.fiveHour.resetAtUnixSeconds)
+                    : L"");
+            addQuotaLine(
+                L"Codex", L"7d", x.weekly.remainingPercent,
+                x.weekly.resetAtUnixSeconds > 0
+                    ? UnixToLocalDateTimeW(
+                        x.weekly.resetAtUnixSeconds)
+                    : L"");
+        } else {
+            t += L"Codex  --\n";
+        }
+
+        if (dash_.GetOptions().showResetRadar) {
+            t += L"\n\u4ECA\u65E5\u5168\u5C40\u91CD\u7F6E\n";
+            if (x.resetRadar.runwaySourceAvailable) {
+                if (x.resetRadar.todayState == ResetTodayState::Yes) {
+                    t += L"\u25CF \u662F";
+                } else if (x.resetRadar.todayState == ResetTodayState::No) {
+                    t += L"\u25CB \u5426";
+                } else {
+                    t += L"? \u672A\u77E5";
+                }
+                if (!x.resetRadar.message.empty()) {
+                    t += L"  \u00B7  " + x.resetRadar.message;
                 }
                 t += L"\n";
+            } else if (x.resetRadar.windowOpen) {
+                t += L"\u25B3 \u8865\u5145\u9884\u6D4B\u7A97\u53E3\u5DF2\u5F00\u542F\n";
+            } else {
+                t += L"? \u6682\u65E0\u53EF\u7528\u7ED3\u8BBA\n";
+            }
+
+            if (x.resetRadar.nextScheduledAtUnixSeconds > 0) {
+                t += L"\u8BA1\u5212  ";
+                t += UnixToLocalDateTimeW(
+                    x.resetRadar.nextScheduledAtUnixSeconds);
+                t += L"\n";
+            } else if (x.resetRadar.latestResetAtUnixSeconds > 0) {
+                t += L"\u6700\u8FD1  ";
+                t += UnixToLocalDateTimeW(
+                    x.resetRadar.latestResetAtUnixSeconds);
+                t += L"\n";
+            }
+
+            auto scopeName = [](const std::wstring& value) {
+                if (value == L"all") return std::wstring(L"\u5168\u90E8\u5957\u9910");
+                if (value == L"weekly") return std::wstring(L"\u5468\u989D\u5EA6");
+                if (value == L"five_hour") return std::wstring(L"5 \u5C0F\u65F6\u989D\u5EA6");
+                if (value == L"unknown") return std::wstring(L"\u672A\u77E5\u989D\u5EA6");
+                if (value == L"plus") return std::wstring(L"Plus");
+                if (value == L"pro") return std::wstring(L"Pro");
+                if (value == L"team") return std::wstring(L"Team");
+                return value;
             };
-            cx(x.fiveHour, L"Codex 5h", false);
-            cx(x.weekly, L"Codex 7d", true);
-            if (!x.errorMessage.empty()) t += L"Codex: " + x.errorMessage + L"\n";
+            auto joinScope = [&](const std::vector<std::wstring>& values) {
+                std::wstring joined;
+                for (const std::wstring& value : values) {
+                    if (!joined.empty()) joined += L" \u00B7 ";
+                    joined += scopeName(value);
+                }
+                return joined;
+            };
+            const std::wstring plans = joinScope(x.resetRadar.scopePlans);
+            const std::wstring windows = joinScope(x.resetRadar.scopeWindows);
+            if (!plans.empty() || !windows.empty()) {
+                t += L"\u8303\u56F4  ";
+                t += plans;
+                if (!plans.empty() && !windows.empty()) t += L" \u00B7 ";
+                t += windows;
+                t += L"\n";
+            }
+            if (x.resetRadar.confidencePercent >= 0) {
+                t += L"\u53EF\u4FE1\u5EA6  ";
+                t += std::to_wstring(x.resetRadar.confidencePercent);
+                t += L"%";
+            }
+            if (x.resetRadar.confidencePercent >= 0) t += L"\n";
+            if (x.resetRadar.probability24h >= 0
+                || x.resetRadar.probability48h >= 0) {
+                t += L"\u8865\u5145\u9884\u6D4B  ";
+                if (x.resetRadar.probability24h >= 0) {
+                    t += L"24h ";
+                    t += std::to_wstring(x.resetRadar.probability24h);
+                    t += L"%";
+                }
+                if (x.resetRadar.probability48h >= 0) {
+                    if (x.resetRadar.probability24h >= 0) t += L"  \u00B7  ";
+                    t += L"48h ";
+                    t += std::to_wstring(x.resetRadar.probability48h);
+                    t += L"%";
+                }
+                t += L"\n";
+            }
+            if (x.resetRadar.updatedAtUnixSeconds > 0) {
+                t += L"\u66F4\u65B0  ";
+                t += UnixToLocalDateTimeW(
+                    x.resetRadar.updatedAtUnixSeconds);
+                t += L"\n";
+            }
+            t += x.resetRadar.runwaySourceAvailable
+                ? L"\u6765\u6E90  Codex Runway / @thsottiaux\n"
+                : L"\u6765\u6E90  codex-reset.com / Codex Reset Radar\n";
+        }
+
+        t += L"\n\u8D26\u6237\n";
+        if (x.resetCredits.success) {
+            t += L"Reset credits  "
+                + std::to_wstring(x.resetCredits.availableCount)
+                + L" \u53EF\u7528";
+            long long earliestExpiry = 0;
+            for (const ResetCredit& credit : x.resetCredits.credits) {
+                std::wstring status = credit.status;
+                std::transform(
+                    status.begin(), status.end(), status.begin(), towlower);
+                if (!status.empty() && status != L"available") continue;
+                if (credit.expiresAtUnixSeconds > 0
+                    && (earliestExpiry == 0
+                        || credit.expiresAtUnixSeconds < earliestExpiry)) {
+                    earliestExpiry = credit.expiresAtUnixSeconds;
+                }
+            }
+            if (earliestExpiry > 0) {
+                t += L"  \u00B7  \u6700\u65E9 ";
+                t += UnixToLocalDateTimeW(earliestExpiry);
+                t += L" \u5230\u671F";
+            }
+            t += L"\n";
+        } else if (!x.resetCredits.errorMessage.empty()) {
+            t += L"Reset credits  "
+                + x.resetCredits.errorMessage + L"\n";
+        }
+        if (c.success && c.usedCredits > 0) {
+            const double amount =
+                c.usedCredits / pow(10.0, c.decimalPlaces);
+            wchar_t buffer[32];
+            swprintf_s(buffer, L"Credits  $%.2f\n", amount);
+            t += buffer;
+        }
+        if (!c.subscriptionStatus.empty()) {
+            t += L"Claude  " + ToWide(c.subscriptionStatus) + L"\n";
+        }
+
+        t += L"\n\u72B6\u6001\n";
+        if (!proxyConfig_.statusMessage.empty()) {
+            t += L"\u7F51\u7EDC  ";
+            t += proxyConfig_.statusMessage;
+            t += L"\n";
+        } else if (proxyConfig_.systemProxyDetected) {
+            t += L"\u7F51\u7EDC  System proxy\n";
         } else {
-            t += L"Codex: "; t += x.errorMessage.empty() ? L"waiting" : x.errorMessage; t += L"\n";
+            t += L"\u7F51\u7EDC  Direct / auto\n";
+        }
+        if (!c.errorMessage.empty()) {
+            t += L"Claude  " + c.errorMessage + L"\n";
+        }
+        if (!x.errorMessage.empty()) {
+            t += L"Codex  " + x.errorMessage + L"\n";
+        }
+        if (!x.resetRadar.errorMessage.empty()) {
+            t += L"\u91CD\u7F6E\u6E90  ";
+            t += x.resetRadar.errorMessage;
+            t += L"\n";
         }
         return t;
     }
