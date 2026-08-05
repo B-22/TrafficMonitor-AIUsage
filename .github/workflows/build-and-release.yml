@@ -68,7 +68,7 @@ jobs:
           "-DCODEX_USAGE_VERSION=${{ steps.version.outputs.version }}"
 
       - name: Build
-        run: cmake --build build/${{ matrix.display_name }} --config Release --target AIUsage CodexUsageTests
+        run: cmake --build build/${{ matrix.display_name }} --config Release --target AIUsage CodexUsageTests ProxyHelperTests
 
       - name: Test
         if: matrix.display_name != 'arm64'
@@ -124,9 +124,14 @@ jobs:
 
       - name: Create tag (for main branch)
         if: github.ref_name == 'main'
+        shell: bash
         run: |
-          git tag ${{ steps.release-tag.outputs.tag }}
-          git push origin ${{ steps.release-tag.outputs.tag }}
+          if git rev-parse "${{ steps.release-tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.release-tag.outputs.tag }} already exists, skipping"
+          else
+            git tag ${{ steps.release-tag.outputs.tag }}
+            git push origin ${{ steps.release-tag.outputs.tag }}
+          fi
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -139,10 +144,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${{ steps.release-tag.outputs.tag }} `
-            release-assets\AIUsage-x86.zip `
-            release-assets\AIUsage-x64.zip `
-            release-assets\AIUsage-arm64.zip `
-            --repo $env:GITHUB_REPOSITORY `
-            --title ${{ steps.release-tag.outputs.tag }} `
-            --generate-notes
+          if (gh release view ${{ steps.release-tag.outputs.tag }} --repo $env:GITHUB_REPOSITORY >$null 2>&1) {
+            Write-Host "Release ${{ steps.release-tag.outputs.tag }} already exists, skipping"
+          } else {
+            gh release create ${{ steps.release-tag.outputs.tag }} `
+              release-assets\AIUsage-x86.zip `
+              release-assets\AIUsage-x64.zip `
+              release-assets\AIUsage-arm64.zip `
+              --repo $env:GITHUB_REPOSITORY `
+              --title ${{ steps.release-tag.outputs.tag }} `
+              --generate-notes
+          }

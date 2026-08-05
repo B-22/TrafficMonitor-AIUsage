@@ -31,6 +31,22 @@
 - 默认不创建 DLL 或目录备份，不生成 `_backup_*`；回退依赖 Git。只有用户明确
   要求时才创建额外备份。
 
+## 同步 GitHub 前的本地验证（强制）
+
+- **禁止推送未经本地完整验证的代码。** 每次 push / PR 到 GitHub 前，必须在本地跑通与
+  CI 完全一致的流程；否则 CI 失败会向仓库所有者发送 GitHub 通知邮件，干扰正常邮件，
+  **属严重问题，必须杜绝**。
+- 本地验证步骤（与 `.github/workflows/build-and-release.yml` 对齐，逐 arch 验证 x64 至少）：
+  1. 配置：`cmake -S . -B build/<arch> -G "Visual Studio 18 2026" -A <arch> -DCMAKE_BUILD_TYPE=Release`
+  2. 构建**全部**目标（含测试）：
+     `cmake --build build/<arch> --config Release --target AIUsage CodexUsageTests ProxyHelperTests`
+     —— 不得只编部分目标；漏掉任一测试目标会导致 CTest 找不到 exe 而 `Not Run` 进而失败。
+  3. 测试：`ctest --test-dir build/<arch> -C Release --output-on-failure`，必须 **0 失败**。
+- 若 CI 仍因任何原因报错：先在本地复现、修复、重新验证通过后再推送，**不得依赖 CI
+  反复试错**；尤其禁止在「本地没跑过完整流程」的状态下直接 push 指望 CI 兜底。
+- 工作流里 Release/打 tag 步骤已做幂等处理（tag / release 已存在则跳过），但本地仍须
+  确认主流程（构建+测试）全绿后再同步。
+
 ## Git 发布
 
 - 发布前查看 `git status` 和完整 diff，只暂存本次范围内的文件。
