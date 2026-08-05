@@ -1,6 +1,6 @@
 # AIUsage — TrafficMonitor Plugin
 
-TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude 和 Codex 的用量、Credits、订阅状态。
+TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude、Codex、Antigravity 的用量/配额和 Kiro Credits 额度。
 
 Windows 11 的视觉语言以 50 像素高的
 [`taskbar_preview.html`](docs/design/taskbar_preview.html) 为设计源：字号、字重、
@@ -138,6 +138,33 @@ Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过
 | Codex 5h 用量 | `/backend-api/wham/usage` | 5 小时窗口已用百分比 |
 | Codex 7d 用量 | `/backend-api/wham/usage` | 7 天窗口已用百分比 |
 | Codex 7d 重置时间 | `/backend-api/wham/usage` `reset_at` | 下次 7d 窗口重置时间 |
+| Antigravity 模型配额 | Google `fetchAvailableModels` | 各模型剩余百分比与重置时间 |
+| Antigravity 订阅档位 | Google `loadCodeAssist` | FREE/PRO/TEAMS 等 |
+| Kiro Credits | Kiro `getUsageLimits` | 已用/总额度与剩余额度 |
+
+### Antigravity 凭据
+
+插件通过 Google OAuth 读取 Antigravity（Google Cloud Code）模型配额，凭据填写在 `AIUsage.ini` 的 `[Antigravity]` 段：
+
+| 配置键 | 必填 | 说明 |
+|--------|------|------|
+| `ClientId` | 否 | 默认使用公开的 Cloud Code installed-app 客户端，无需填写 |
+| `ClientSecret` | 是 | 登录 Antigravity 时使用的 OAuth client secret |
+| `AccessToken` | 二选一 | 已签发的 access token（过期后需手动更换） |
+| `RefreshToken` | 二选一（推荐） | 自动刷新 access token，无需手工维护 |
+| `PrimaryModel` | 否 | 任务栏圆环的"主模型"（子串匹配），留空自动选择 |
+
+主模型自动选择规则：优先 Gemini 3.x，其次 Claude，再其次 GPT；同优先级取剩余最少（最紧张）的模型。令牌只保存在本机配置文件中，不会上传到任何服务器。
+
+### Kiro Credits 凭据
+
+Kiro Credits 通过 Kiro IDE 的本地登录态读取，无需手动填凭据：
+
+- 读取 `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json`（Kiro 登录时写入）
+- 自动经 `prod.us-east-1.auth.desktop.kiro.dev/refreshToken` 刷新 access token
+- 请求 `q.us-east-1.amazonaws.com/getUsageLimits` 获取额度
+- 若令牌在其他位置，可在 `[Kiro]` 段的 `TokenPath` 覆盖
+- 本机未登录 Kiro 时该来源显示 `--`
 | Codex 重置卡 | `/backend-api/wham/rate-limit-reset-credits` | 可用总数、逐卡发放/过期时间 |
 | 今日全局重置 | Codex Runway `api/status.json` | 本地日期的“是 / 否 / 未知”、计划、范围与证据 |
 | 全局重置补充预测 | `codex-reset.com/api/forecast` + Codex 雷达公开摘要 | 次级公告窗口与 24/48h 概率 |
@@ -150,6 +177,10 @@ Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过
 | Claude 7d 圆环 | 自动 | 始终显示 | 第一组 7d，用量色环和百分比数字 |
 | Codex 5h 圆环 | 自动 | 始终显示 | 第二组 5h，用量色环和百分比数字 |
 | Codex 7d 圆环 | 自动 | 始终显示 | 第二组 7d，用量色环和百分比数字 |
+| Antigravity 圆环 | `ShowAntigravity` | 显示 | 第三组，主模型已用百分比，角标 `AG` |
+| Kiro 圆环 | `ShowKiro` | 显示 | 第三组，Credits 已用百分比，角标 `Kiro` |
+| Antigravity 档位块 | `ShowAntigravity` | 显示 | 信息块 `AG`，值为订阅档位（FREE/PRO/...） |
+| Kiro 剩余额度块 | `ShowKiro` | 显示 | 信息块 `Kiro`，值为剩余额度，非百分比 |
 | 百分比号 | `ShowPctSign` | 隐藏 | 0=只显示数字, 1=显示% |
 | Credits 金额 | `ShowCredits` | 显示 | Claude 超额用量金额 |
 | 5h 重置时间 | `ShowReset` | 显示 | 下次 5h 窗口重置时间 |
@@ -189,7 +220,7 @@ Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过
 
 ### 过期状态
 
-- Claude 和 Codex 分别记录最后成功更新时间
+- Claude、Codex、Antigravity、Kiro 分别记录最后成功更新时间
 - 超过 1 分钟：对应圆环数字下显示黄色短横线
 - 超过 5 分钟：短横线变为红色
 - 超过 10 分钟：原有 Claude/Codex 星期值改为 `12分` 形式，超过 99 分钟固定为 `99+分`
@@ -219,11 +250,19 @@ Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过
 **Codex**：
 - `~/.codex/auth.json`（支持 token 刷新和写回）
 
+**Antigravity**：
+- `AIUsage.ini` 的 `[Antigravity]` 段（ClientSecret + RefreshToken 推荐）
+- 自动通过 `oauth2.googleapis.com/token` 刷新 access token，不修改本地文件
+
+**Kiro**：
+- 只读 `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json`（Kiro IDE 登录态）
+- 自动经 Kiro 官方 auth 端点刷新 access token，不写回本地缓存
+
 ### 数据刷新逻辑
 
 - 后台线程每 60 秒刷新
 - UI 线程只读缓存，不阻塞任务栏
-- Claude/Codex 独立请求，互不影响
+- Claude/Codex/Antigravity/Kiro 独立请求，互不影响
 - 429 限流指数退避（120s → 900s）
 - 失败保留最后一次成功数据
 - Profile API 仅首次请求一次（获取订阅状态）
@@ -263,7 +302,8 @@ VerifyTargetHostExitIp=1
 ### 安全
 
 - 日志不记录 token、Authorization、Cookie 等敏感信息
-- 不修改或删除 Claude/Codex 官方凭据文件
+- 不修改或删除 Claude/Codex 官方凭据文件；Kiro 令牌缓存只读、不写回
+- Antigravity 的 OAuth 凭据只存在于本机 `AIUsage.ini`，不记录到 Git
 - Token 刷新沿用参考项目的安全写入方式
 
 ## 插件选项（AIUsage.ini）
@@ -290,12 +330,24 @@ ResetCreditWarningHours=48
 ShowResetRadar=1
 ResetRadarRefreshMinutes=15
 RunwayResetRefreshMinutes=60
+ShowAntigravity=1        # 显示 Antigravity 圆环 + 档位块
+ShowKiro=1               # 显示 Kiro 圆环 + 剩余额度块
 CustomSubExpiry=       # 可选 YYYY-MM-DD；仓库模板必须留空
 ProxyServer=           # 代理地址
 RequireProxy=1         # 无代理时阻止；AllowedExitIPs 可作为 TUN 放行条件
 AllowedExitIPs=        # 精确公网 IP 白名单，非空即启用 fail-closed
 ExitIpCheckUrl=https://api.ipify.org/
 VerifyTargetHostExitIp=1
+
+[Antigravity]          # Google OAuth 凭据，仅存本机
+ClientId=
+ClientSecret=
+AccessToken=
+RefreshToken=
+PrimaryModel=          # 主模型子串，留空自动选择
+
+[Kiro]                 # Kiro IDE 登录态
+TokenPath=             # 默认 %USERPROFILE%\.aws\sso\cache\kiro-auth-token.json
 ```
 
 ## 构建
@@ -324,6 +376,24 @@ ctest --test-dir build -C Release --output-on-failure
 DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本地可使用
 `deploy-local.ps1` 执行这一严格流程；脚本不会覆盖本机 `AIUsage.ini`。
 
+### 可选的上游转发服务（server/）
+
+`server/` 提供一个可选的 Go 转发服务：插件把 Claude/Codex 的 OAuth 凭据
+一次性上传给该服务，由服务在自身网络出口（如家宽 IPv6）上代请求官方用量接口，
+再回传给插件。这样插件所在机器的出口 IP 不会暴露给官方 API。
+
+- 构建：`cd server && go build`
+- 配置全部通过环境变量，至少需要 `AIUSAGE_TOKEN`（服务间共享的 bearer token）
+- 环境变量：`AIUSAGE_LISTEN`（默认 `127.0.0.1:8444`）、`AIUSAGE_CACHE_USAGE`
+  /`AIUSAGE_CACHE_CREDITS`/`AIUSAGE_CACHE_PROFILE`（缓存秒数）、
+  `AIUSAGE_CLAUDE_CLIENT_ID`（默认公开的 Cloud Code 客户端）、
+  `AIUSAGE_TLS_CERT`/`AIUSAGE_TLS_KEY`（可选 TLS）
+- 凭据只保存在服务进程内存，不落盘；所有端点都要求 bearer token 认证
+- 测试：`go test ./...`
+
+默认插件仍是直连官方 API，不使用该服务；仅当部署该服务并配置插件指向它时才会
+用到。
+
 ## 文件结构
 
 ```
@@ -338,19 +408,26 @@ DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本�
 │   └── PluginInterface.h
 ├── src/
 │   ├── CodexUsagePlugin.cpp       # 主插件 + GDI 自绘
+│   ├── DashboardRenderer.cpp/h    # Direct2D/GDI 双路径渲染
 │   ├── CodexUsageFetcher.cpp/h    # Codex 令牌 + API
 │   ├── CodexUsageCore.cpp/h       # Codex JSON 解析
 │   ├── ClaudeUsageFetcher.cpp/h   # Claude API + profile
 │   ├── ClaudeCredentialReader.cpp/h  # Claude 凭据读取
 │   ├── DpapiHelper.cpp/h          # DPAPI + AES-GCM
 │   ├── ProxyHelper.cpp/h          # 代理检测
+│   ├── AntigravityUsageFetcher.cpp/h  # Antigravity OAuth + 配额
+│   ├── KiroCreditsFetcher.cpp/h   # Kiro Credits 额度
 │   ├── JsonLite.cpp/h             # JSON 解析器
 │   └── CodexUsageVersion.h.in
 ├── tests/
 │   ├── CodexUsageCoreTests.cpp
 │   └── ProxyHelperTests.cpp
-└── docs/
-    └── design/                    # 设计稿
+└── server/                        # 可选 Go 转发服务（见“构建”一节）
+    ├── main.go                    # HTTP 服务 + 上游转发 + 内存缓存
+    ├── refresh.go                 # Claude token 刷新
+    └── server_test.go             # 服务测试
+
+docs/                              # 设计稿
 ```
 
 ## 协作与发布约束
@@ -373,6 +450,10 @@ DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本�
 - **[Licoy/codex-runway](https://github.com/Licoy/codex-runway)** — 今日重置公开
   feed、schema 与悬浮信息层级参考。上游采用 AGPL-3.0；本插件未复制其 Swift/服务端
   源码，只独立实现公开 v1 数据格式的 Windows 消费端。
+- **[wusimpl/AntigravityQuotaWatcher](https://github.com/wusimpl/AntigravityQuotaWatcher)** 与
+  **[AntigravityQuotaWatcherDesktop](https://github.com/wusimpl/AntigravityQuotaWatcherDesktop)** —
+  Antigravity 配额 API（loadCodeAssist / fetchAvailableModels）、Google OAuth
+  流程与 Kiro Credits（AWS SSO 缓存 + getUsageLimits）实现参考。
 
 ## 许可证
 

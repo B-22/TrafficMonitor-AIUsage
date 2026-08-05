@@ -1,5 +1,7 @@
 #include "CodexUsageFetcher.h"
 #include "ClaudeUsageFetcher.h"
+#include "AntigravityUsageFetcher.h"
+#include "KiroCreditsFetcher.h"
 #include "CodexUsageVersion.h"
 #include "DashboardRenderer.h"
 #include "ProxyHelper.h"
@@ -12,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -311,6 +314,15 @@ std::wstring IsoToLocalTimeW(const std::string& iso) {
     return buf;
 }
 
+std::wstring IsoToLocalDateTimeW(const std::string& iso) {
+    SYSTEMTIME local{};
+    if (!IsoToLocalSystemTime(iso, &local)) return L"--";
+    wchar_t buffer[48];
+    swprintf_s(buffer, L"%04d-%02d-%02d %02d:%02d",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
+    return buffer;
+}
+
 std::wstring IsoToCompactDateW(const std::string& iso) {
     return FormatIsoDateAsMonthDay(iso);
 }
@@ -395,11 +407,14 @@ struct PluginOptions {
     bool show7dCountdown = true;    // show the nearest 7d reset
     bool showResetCreditWarning = true;
     bool showResetRadar = true;
+    bool showAntigravity = true;    // show Antigravity ring + tier block
+    bool showKiro = true;           // show Kiro ring + credits block
     int countdownShowBeforeHours = 24;
     int resetCreditWarningHours = 48;
     int resetRadarRefreshMinutes = 15;
     int resetTodayRefreshMinutes = 60;
     std::string customSubExpiry;
+    std::string antigravityPrimaryModel;  // featured model override
 };
 
 // =====================================================================
@@ -426,6 +441,17 @@ struct DashData {
     int resetProbability24h = -1;
     int resetProbability48h = -1;
     long long resetRadarUpdatedUnix = 0;
+    // Antigravity featured model (used %), tier and freshness.
+    int agPct = -1;
+    std::string agTier;
+    bool agAvailable = false;
+    double lastAgOk = 0;
+    // Kiro credits: used %, remaining credits and freshness.
+    int kiroPct = -1;
+    long long kiroRemaining = 0;
+    long long kiroLimit = 0;
+    bool kiroAvailable = false;
+    double lastKiroOk = 0;
 };
 
 std::wstring FormatCredits(const DashData& data) {
@@ -447,6 +473,52 @@ std::wstring FormatSubscriptionStatus(const DashData& data) {
     if (data.subStatus == "past_due") return L"\u903E\u671F";
     if (data.subStatus == "paused") return L"\u5DF2\u6682\u505C";
     return L"--";
+}
+
+// Pick the model that drives the Antigravity ring. When PrimaryModel is
+// configured it wins (substring match on the raw key); falling back to the
+// highest-priority pool (Gemini 3.x > Claude > GPT), broken to the
+// most-exhausted model so the ring reflects the tightest quota.
+int AntigravityModelPriority(const std::string& name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower.find("gemini-3") != std::string::npos) return 3;
+    if (lower.find("claude") != std::string::npos) return 2;
+    if (lower.find("gpt") != std::string::npos) return 1;
+    return 0;
+}
+
+const AntigravityModelQuota* SelectFeaturedModel(
+    const AntigravityUsageData& data, const std::string& primary) {
+    if (data.models.empty()) return nullptr;
+    if (!primary.empty()) {
+        const AntigravityModelQuota* match = nullptr;
+        for (const auto& m : data.models) {
+            if (m.modelName.find(primary) != std::string::npos) {
+                if (!match || m.remainingFraction < match->remainingFraction) {
+                    match = &m;
+                }
+            }
+        }
+        if (match) return match;
+    }
+    const AntigravityModelQuota* best = nullptr;
+    int bestPriority = -1;
+    for (const auto& m : data.models) {
+        const int p = AntigravityModelPriority(m.modelName);
+        if (p > bestPriority
+            || (p == bestPriority && best
+                && m.remainingFraction < best->remainingFraction)) {
+            best = &m;
+            bestPriority = p;
+        }
+    }
+    return best;
+}
+
+std::wstring FormatKiroRemaining(const DashData& data) {
+    if (!data.kiroAvailable || data.kiroRemaining < 0) return L"--";
+    return std::to_wstring(data.kiroRemaining);
 }
 
 double SourceAge(bool available, double lastSuccess) {
@@ -561,6 +633,11 @@ public:
         }
         int width = 162;
         if (opts.showResetRadar && snap.resetRadarWindowOpen) width += 16;
+        if (opts.showAntigravity || opts.showKiro) {
+            const int n = (opts.showAntigravity ? 1 : 0)
+                        + (opts.showKiro ? 1 : 0);
+            width += 11 + n * 28 + (n > 1 ? 6 : 0);
+        }
         bool hasInfoBlock = false;
         const auto addEstimatedBlock = [&](int blockWidth) {
             width += blockWidth;
@@ -570,6 +647,8 @@ public:
         if (opts.showReset) addEstimatedBlock(48);
         if (opts.showSubscription) addEstimatedBlock(55);
         if (opts.showCustomExpiry) addEstimatedBlock(45);
+        if (opts.showAntigravity) addEstimatedBlock(38);
+        if (opts.showKiro) addEstimatedBlock(45);
         if (opts.showClaude7dReset) {
             addEstimatedBlock(opts.show7dCountdown ? 55 : 45);
         }
@@ -615,6 +694,13 @@ public:
                   + 2 * m.ringGap
                   + m.ringGroupGap
                   + 2 * m.sepMargin;
+        const int extraRingCount = (opts.showAntigravity ? 1 : 0)
+                                 + (opts.showKiro ? 1 : 0);
+        if (extraRingCount > 0) {
+            width += m.ringGroupGap
+                   + extraRingCount * ringCell
+                   + (extraRingCount > 1 ? m.ringGap : 0);
+        }
         if (opts.showResetRadar && snap.resetRadarWindowOpen) {
             width += textWidth(
                 L"\u26A1", L"Segoe UI Symbol",
@@ -632,6 +718,14 @@ public:
         if (opts.showReset) {
             addBlock(L"5h\u91CD\u7F6E",
                      snap.c5Reset.empty() ? L"--" : IsoToLocalTimeW(snap.c5Reset));
+        }
+        if (opts.showAntigravity) {
+            const std::wstring tier = snap.agTier.empty()
+                ? L"--" : ToWide(snap.agTier);
+            addBlock(L"AG", tier.c_str());
+        }
+        if (opts.showKiro) {
+            addBlock(L"Kiro", FormatKiroRemaining(snap).c_str());
         }
         if (opts.showSubscription) {
             const bool hasStatusDot = snap.subStatus == "active"
@@ -842,6 +936,10 @@ public:
             snap.claudeAvailable, snap.lastClaudeOk, snap.refreshInProgress, colors);
         const COLORREF codexFreshness = FreshnessMarkerColor(
             snap.codexAvailable, snap.lastCodexOk, snap.refreshInProgress, colors);
+        const COLORREF agFreshness = FreshnessMarkerColor(
+            snap.agAvailable, snap.lastAgOk, snap.refreshInProgress, colors);
+        const COLORREF kiroFreshness = FreshnessMarkerColor(
+            snap.kiroAvailable, snap.lastKiroOk, snap.refreshInProgress, colors);
         const int claude5Center = ring(
             snap.c5, GaugeColor(snap.c5, colors), L"5h",
             claudeFreshness, m.ringGap);
@@ -866,6 +964,31 @@ public:
             snap.x7, GaugeColor(snap.x7, colors), L"7d",
             codexFreshness, 0);
         providerLabel(L"Codex", codex5Center, codex7Center);
+
+        // ── Antigravity + Kiro group ──
+        if (opts.showAntigravity || opts.showKiro) {
+            const int group2SeparatorX = curX + m.ringGroupGap / 2;
+            canvas.DrawLine(
+                static_cast<float>(group2SeparatorX),
+                layout.dividerTop,
+                static_cast<float>(group2SeparatorX),
+                layout.dividerBottom,
+                colors.separator);
+            curX += m.ringGroupGap;
+            if (opts.showAntigravity) {
+                const int agCenter = ring(
+                    snap.agPct, GaugeColor(snap.agPct, colors), L"AG",
+                    agFreshness,
+                    opts.showKiro ? m.ringGap : 0);
+                (void)agCenter;
+            }
+            if (opts.showKiro) {
+                const int kiroCenter = ring(
+                    snap.kiroPct, GaugeColor(snap.kiroPct, colors), L"Kiro",
+                    kiroFreshness, 0);
+                (void)kiroCenter;
+            }
+        }
 
         // ── Separator 1 ──
         curX += m.sepMargin;
@@ -948,6 +1071,16 @@ public:
         if (opts.showReset) {
             std::wstring rs = snap.c5Reset.empty() ? L"--" : IsoToLocalTimeW(snap.c5Reset);
             block(L"5h\u91CD\u7F6E", rs.c_str());
+        }
+
+        if (opts.showAntigravity) {
+            const std::wstring tier = snap.agTier.empty()
+                ? L"--" : ToWide(snap.agTier);
+            block(L"AG", tier.c_str());
+        }
+
+        if (opts.showKiro) {
+            block(L"Kiro", FormatKiroRemaining(snap).c_str());
         }
 
         if (opts.showSubscription) {
@@ -1094,6 +1227,8 @@ public:
         std::thread([this]() {
             auto claude = claude_.Fetch();
             auto codex = codex_.Fetch();
+            auto ag = ag_.Fetch();
+            auto kiro = kiro_.Fetch();
             DashData d = dash_.GetSnapshot();
             const double t = static_cast<double>(time(nullptr));
             if (claude.success) {
@@ -1139,10 +1274,29 @@ public:
                 d.resetRadarUpdatedUnix =
                     codex.resetRadar.updatedAtUnixSeconds;
             }
+            if (ag.success) {
+                const PluginOptions agOpts = dash_.GetOptions();
+                if (const AntigravityModelQuota* featured =
+                        SelectFeaturedModel(ag, agOpts.antigravityPrimaryModel)) {
+                    const int remainingPct =
+                        std::clamp(featured->percent(), 0, 100);
+                    d.agPct = 100 - remainingPct;
+                }
+                d.agTier = ag.tier;
+                d.agAvailable = true;
+                d.lastAgOk = ag.lastSuccessTime > 0 ? ag.lastSuccessTime : t;
+            }
+            if (kiro.success && kiro.percent >= 0) {
+                d.kiroPct = std::clamp(100 - kiro.percent, 0, 100);
+                d.kiroRemaining = kiro.remaining;
+                d.kiroLimit = kiro.limit;
+                d.kiroAvailable = true;
+                d.lastKiroOk = kiro.lastSuccessTime > 0 ? kiro.lastSuccessTime : t;
+            }
             d.refreshInProgress = false;
             dash_.SetSnapshot(d);
             std::lock_guard<std::mutex> lk(mu_);
-            tip_ = BuildTip(claude, codex);
+            tip_ = BuildTip(claude, codex, ag, kiro);
             busy_ = false;
         }).detach();
     }
@@ -1150,7 +1304,7 @@ public:
     const wchar_t* GetInfo(PluginInfoIndex i) override {
         switch (i) {
             case TMI_NAME:        return L"AI Usage";
-            case TMI_DESCRIPTION: return L"Claude & Codex usage dashboard.";
+            case TMI_DESCRIPTION: return L"Claude, Codex, Antigravity & Kiro usage dashboard.";
             case TMI_AUTHOR:      return L"B-22";
             case TMI_COPYRIGHT:   return L"MIT";
             case TMI_VERSION:     return CODEX_USAGE_VERSION_WIDE;
@@ -1247,7 +1401,10 @@ public:
             L" 13. Show Reset Radar:      %s\n"
             L" 14. Forecast Refresh:      %d minutes\n"
             L" 15. Runway Refresh:        %d minutes\n"
-            L" 16. Custom Sub Expiry:     %s\n\n"
+            L" 16. Custom Sub Expiry:     %s\n"
+            L" 17. Show Antigravity:      %s\n"
+            L" 18. Show Kiro Credits:     %s\n"
+            L" 19. AG Primary Model:      %s\n\n"
             L"Proxy Settings:\n"
             L"  Proxy Server:   %s\n"
             L"  Require Proxy:  %s\n"
@@ -1265,6 +1422,10 @@ public:
             L"  Codex 5h%%:     %d\n"
             L"  Codex 7d%%:     %d\n"
             L"  Codex 7d Reset:  %s\n"
+            L"  AG Ring (used%%): %d\n"
+            L"  AG Tier:         %s\n"
+            L"  Kiro Ring (used%%): %d\n"
+            L"  Kiro Remaining:  %lld\n"
             L"  Reset Cards:     %d\n"
             L"  Card Expiry:     %s\n"
             L"  Radar Window:    %s\n"
@@ -1287,10 +1448,20 @@ public:
             L"  ShowResetRadar=1\n"
             L"  ResetRadarRefreshMinutes=15\n"
             L"  RunwayResetRefreshMinutes=60\n"
+            L"  ShowAntigravity=1\n"
+            L"  ShowKiro=1\n"
             L"  CustomSubExpiry=\n"
             L"  ProxyServer=\n"
             L"  RequireProxy=1\n"
-            L"  AllowedExitIPs=203.0.113.10",
+            L"  AllowedExitIPs=203.0.113.10\n"
+            L"  [Antigravity]\n"
+            L"  ClientId=\n"
+            L"  ClientSecret=\n"
+            L"  AccessToken=\n"
+            L"  RefreshToken=\n"
+            L"  PrimaryModel=\n"
+            L"  [Kiro]\n"
+            L"  TokenPath=",
             o.showPctSign ? L"Yes" : L"No",
             o.showCredits ? L"Yes" : L"No",
             o.showReset ? L"Yes" : L"No",
@@ -1307,6 +1478,9 @@ public:
             o.resetRadarRefreshMinutes,
             o.resetTodayRefreshMinutes,
             o.customSubExpiry.empty() ? L"(auto)" : std::wstring(o.customSubExpiry.begin(), o.customSubExpiry.end()).c_str(),
+            o.showAntigravity ? L"Yes" : L"No",
+            o.showKiro ? L"Yes" : L"No",
+            o.antigravityPrimaryModel.empty() ? L"(auto)" : std::wstring(o.antigravityPrimaryModel.begin(), o.antigravityPrimaryModel.end()).c_str(),
             proxyServer.empty() ? L"(system)" : proxyServer.c_str(),
             requireProxy ? L"Yes" : L"No",
             allowedExitIps.empty() ? L"(disabled)" : allowedExitIps.c_str(),
@@ -1319,6 +1493,9 @@ public:
             c7ResetBuf,
             snap.x5, snap.x7,
             x7ResetBuf,
+            snap.agPct,
+            snap.agTier.empty() ? L"--" : std::wstring(snap.agTier.begin(), snap.agTier.end()).c_str(),
+            snap.kiroPct, snap.kiroRemaining,
             snap.resetCreditCount,
             resetCreditExpiry.c_str(),
             snap.resetRadarWindowOpen ? L"Open" : L"Closed",
@@ -1416,6 +1593,16 @@ private:
             buf, 256, iniPath.c_str());
         o.showResetRadar = (buf[0] == L'1');
 
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowAntigravity", L"1",
+            buf, 256, iniPath.c_str());
+        o.showAntigravity = (buf[0] == L'1');
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowKiro", L"1",
+            buf, 256, iniPath.c_str());
+        o.showKiro = (buf[0] == L'1');
+
         o.countdownShowBeforeHours = std::clamp(
             static_cast<int>(GetPrivateProfileIntW(
                 L"AIUsage", L"CountdownShowBeforeHours", 24, iniPath.c_str())),
@@ -1480,9 +1667,57 @@ private:
         codex_.SetRadarRefreshMinutes(o.resetRadarRefreshMinutes);
         codex_.SetResetTodayRefreshMinutes(
             o.resetTodayRefreshMinutes);
+
+        // Antigravity credentials ([Antigravity] section).
+        ag_.SetEnabled(o.showAntigravity);
+        ag_.SetProxyConfig(proxyConfig_);
+        std::string agClientId, agClientSecret, agAccessToken, agRefreshToken;
+        {
+            auto readSection = [&](const wchar_t* key, std::string& out) {
+                wchar_t sbuf[2048];
+                GetPrivateProfileStringW(
+                    L"Antigravity", key, L"", sbuf, 2048, iniPath.c_str());
+                out.clear();
+                int slen = WideCharToMultiByte(
+                    CP_UTF8, 0, sbuf, -1, nullptr, 0, nullptr, nullptr);
+                if (slen > 1) {
+                    out.resize(static_cast<size_t>(slen));
+                    if (WideCharToMultiByte(
+                            CP_UTF8, 0, sbuf, -1, out.data(),
+                            slen, nullptr, nullptr) > 0) {
+                        out.pop_back();
+                    } else {
+                        out.clear();
+                    }
+                }
+            };
+            readSection(L"ClientId", agClientId);
+            readSection(L"ClientSecret", agClientSecret);
+            readSection(L"AccessToken", agAccessToken);
+            readSection(L"RefreshToken", agRefreshToken);
+            std::string agPrimaryModel;
+            readSection(L"PrimaryModel", agPrimaryModel);
+            o.antigravityPrimaryModel = agPrimaryModel;
+        }
+        ag_.SetCredentials(
+            agAccessToken, agRefreshToken, agClientId, agClientSecret);
+        ag_.SetPrimaryModel(o.antigravityPrimaryModel);
+
+        // Kiro token cache path override ([Kiro] section).
+        kiro_.SetEnabled(o.showKiro);
+        kiro_.SetProxyConfig(proxyConfig_);
+        wchar_t kiroPath[1024];
+        GetPrivateProfileStringW(
+            L"Kiro", L"TokenPath", L"", kiroPath, 1024, iniPath.c_str());
+        if (kiroPath[0] != L'\0') {
+            kiro_.SetTokenFilePath(kiroPath);
+        }
+        dash_.SetOptions(o);
     }
 
-    std::wstring BuildTip(const ClaudeUsageData& c, const UsageSnapshot& x) const {
+    std::wstring BuildTip(const ClaudeUsageData& c, const UsageSnapshot& x,
+                          const AntigravityUsageData& ag,
+                          const KiroCreditsData& kiro) const {
         std::wstring t = L"AI Usage\n";
         t += L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n";
         t += L"\u914D\u989D\n";
@@ -1546,6 +1781,42 @@ private:
                     : L"");
         } else {
             t += L"Codex  --\n";
+        }
+
+        if (ag.success && !ag.models.empty()) {
+            for (const auto& model : ag.models) {
+                t += ToWide(model.displayName);
+                t += L"  ";
+                t += std::to_wstring(std::clamp(model.percent(), 0, 100));
+                t += L"% \u5269\u4F59";
+                if (!model.resetTime.empty()) {
+                    t += L"  \u00B7  ";
+                    t += IsoToLocalDateTimeW(model.resetTime);
+                    t += L" \u91CD\u7F6E";
+                }
+                t += L"\n";
+            }
+            if (!ag.tier.empty()) {
+                t += L"\u5957\u9910  " + ToWide(ag.tier) + L"\n";
+            }
+        } else {
+            t += L"Antigravity  --\n";
+        }
+
+        if (kiro.success) {
+            t += L"Kiro Credits  ";
+            t += std::to_wstring(kiro.remaining);
+            t += L" / ";
+            t += std::to_wstring(kiro.limit);
+            t += L" \u5269\u4F59";
+            if (kiro.percent >= 0) {
+                t += L"  \u00B7  ";
+                t += std::to_wstring(std::clamp(kiro.percent, 0, 100));
+                t += L"%";
+            }
+            t += L"\n";
+        } else {
+            t += L"Kiro Credits  --\n";
         }
 
         if (dash_.GetOptions().showResetRadar) {
@@ -1694,6 +1965,12 @@ private:
         if (!x.errorMessage.empty()) {
             t += L"Codex  " + x.errorMessage + L"\n";
         }
+        if (!ag.errorMessage.empty()) {
+            t += L"Antigravity  " + ag.errorMessage + L"\n";
+        }
+        if (!kiro.errorMessage.empty()) {
+            t += L"Kiro  " + kiro.errorMessage + L"\n";
+        }
         if (!x.resetRadar.errorMessage.empty()) {
             t += L"\u91CD\u7F6E\u6E90  ";
             t += x.resetRadar.errorMessage;
@@ -1705,6 +1982,8 @@ private:
     AIDashboardItem dash_;
     ClaudeUsageFetcher claude_;
     CodexUsageFetcher codex_;
+    AntigravityUsageFetcher ag_;
+    KiroCreditsFetcher kiro_;
     ProxyConfig proxyConfig_;
     std::wstring configDir_;
     mutable std::mutex mu_;
