@@ -1212,6 +1212,20 @@ public:
 
     void DataRequired() override {
         auto now = std::chrono::steady_clock::now();
+        bool applyPendingConfig = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (busy_) return;
+            if (configReloadPending_) {
+                configReloadPending_ = false;
+                applyPendingConfig = true;
+            }
+        }
+        // Safe point: busy_ is false, so no background fetch thread is running
+        // and nothing else reads proxyConfig_ or the fetcher credentials.
+        // Both DataRequired() and OnExtenedInfo() run on the host UI thread,
+        // so they cannot interleave with each other.
+        if (applyPendingConfig) ApplyConfigFromIni();
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (busy_) return;
@@ -1545,7 +1559,22 @@ private:
         }
     }
 
+    // Entry point used by the constructor and by OnExtenedInfo(). If a
+    // background fetch is in flight, applying the config now would race with
+    // the fetcher threads reading proxyConfig_ / credentials, so defer it to
+    // the next DataRequired() tick instead.
     void LoadConfig() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (busy_) {
+                configReloadPending_ = true;
+                return;
+            }
+        }
+        ApplyConfigFromIni();
+    }
+
+    void ApplyConfigFromIni() {
         if (configDir_.empty()) return;
         std::wstring iniPath = configDir_ + L"\\AIUsage.ini";
         const DWORD attributes = GetFileAttributesW(iniPath.c_str());
@@ -1989,6 +2018,7 @@ private:
     mutable std::mutex mu_;
     std::wstring tip_ = L"AI Usage: waiting for data";
     bool busy_ = false;
+    bool configReloadPending_ = false;
     std::chrono::steady_clock::time_point lastFetch_{};
     static constexpr std::chrono::minutes interval_{1};
 };

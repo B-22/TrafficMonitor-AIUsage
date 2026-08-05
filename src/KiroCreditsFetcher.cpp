@@ -118,9 +118,14 @@ std::optional<std::string> KiroCreditsFetcher::HttpPost(
         for (const auto& h : headers)
             WinHttpAddRequestHeaders(request, h.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
         WinHttpSetTimeouts(request, 10000, 10000, 10000, 30000);
-        std::wstring wbody(body.begin(), body.end());
+        // The request body is already UTF-8 bytes. WinHttpSendRequest takes a
+        // raw byte buffer, so it must NOT be widened to UTF-16.
+        LPVOID bodyPtr = body.empty()
+            ? WINHTTP_NO_REQUEST_DATA
+            : (LPVOID)const_cast<char*>(body.data());
+        const DWORD bodyLen = (DWORD)body.size();
         if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                (LPVOID)wbody.c_str(), (DWORD)wbody.size(), (DWORD)wbody.size(), 0)) {
+                bodyPtr, bodyLen, bodyLen, 0)) {
             if (errorMessage) *errorMessage = L"WinHttpSendRequest failed"; break;
         }
         if (!WinHttpReceiveResponse(request, nullptr)) {
@@ -316,21 +321,41 @@ KiroCreditsData KiroCreditsFetcher::Fetch() {
             if (list->IsArray()) {
                 if (const auto* arr = list->AsArray()) {
                     for (const auto& item : *arr) {
-                        const auto* io = item.AsObject();
-                        if (!io) continue;
-                        auto* rt = io->Find("resourceType");
-                        auto rs = rt ? rt->AsString() : std::nullopt;
+                        if (!item.IsObject()) continue;
+                        // Find() is a member of jsonlite::Value, not of Object.
+                        const jsonlite::Value* rt = item.Find("resourceType");
+                        auto rs = rt ? rt->AsString()
+                                     : std::optional<std::string_view>{};
                         if (!rs || *rs != "CREDIT") continue;
-                        if (auto* cu = io->Find("currentUsage")) if (auto v = cu->AsNumber()) used = (long long)*v;
-                        if (auto* lu = io->Find("usageLimit")) if (auto v = lu->AsNumber()) limit = (long long)*v;
+                        if (const jsonlite::Value* cu = item.Find("currentUsage")) {
+                            if (auto v = cu->AsNumber()) used = (long long)*v;
+                        }
+                        if (const jsonlite::Value* lu = item.Find("usageLimit")) {
+                            if (auto v = lu->AsNumber()) limit = (long long)*v;
+                        }
                         break;
                     }
                 }
             }
         } else {
-            if (auto* u = root->Find("used")) if (auto v = u->AsNumber()) used = (long long)*v;
-            if (auto* l = root->Find("limit")) if (auto v = l->AsNumber()) limit = (long long)*v;
-            else if (auto* l = root->Find("totalCredits")) if (auto v = l->AsNumber()) limit = (long long)*v;
+            if (const jsonlite::Value* u = root->Find("used")) {
+                if (auto v = u->AsNumber()) used = (long long)*v;
+            }
+            // Braces are required here: without them the trailing `else`
+            // binds to the inner AsNumber() check, so a missing "limit" key
+            // would never fall back to "totalCredits".
+            bool limitResolved = false;
+            if (const jsonlite::Value* l = root->Find("limit")) {
+                if (auto v = l->AsNumber()) {
+                    limit = (long long)*v;
+                    limitResolved = true;
+                }
+            }
+            if (!limitResolved) {
+                if (const jsonlite::Value* l = root->Find("totalCredits")) {
+                    if (auto v = l->AsNumber()) limit = (long long)*v;
+                }
+            }
         }
         data.used = used;
         data.limit = limit;

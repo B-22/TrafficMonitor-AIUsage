@@ -2,6 +2,7 @@
 
 #include "ProxyHelper.h"
 
+#include <cmath>
 #include <optional>
 #include <string>
 #include <vector>
@@ -83,7 +84,7 @@ private:
     // Ensure a valid (non-expired) access token, refreshing if needed.
     bool EnsureAccessToken(std::wstring* errorMessage);
 
-    std::optional<std::string> RefreshAccessToken(std::wstring* errorMessage);
+    bool RefreshAccessToken(std::wstring* errorMessage);
 
     bool ParseModels(const std::string& body, AntigravityUsageData& out);
 

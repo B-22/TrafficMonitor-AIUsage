@@ -117,9 +117,14 @@ std::optional<std::string> AntigravityUsageFetcher::HttpPost(
         }
         WinHttpSetTimeouts(request, 10000, 10000, 10000, 15000);
 
-        std::wstring wbody(body.begin(), body.end());
+        // The request body is already UTF-8 bytes. WinHttpSendRequest takes a
+        // raw byte buffer, so it must NOT be widened to UTF-16.
+        LPVOID bodyPtr = body.empty()
+            ? WINHTTP_NO_REQUEST_DATA
+            : (LPVOID)const_cast<char*>(body.data());
+        const DWORD bodyLen = (DWORD)body.size();
         if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                (LPVOID)wbody.c_str(), (DWORD)wbody.size(), (DWORD)wbody.size(), 0)) {
+                bodyPtr, bodyLen, bodyLen, 0)) {
             if (errorMessage) *errorMessage = L"WinHttpSendRequest failed"; break;
         }
         if (!WinHttpReceiveResponse(request, nullptr)) {
@@ -307,19 +312,17 @@ bool AntigravityUsageFetcher::ParseModels(const std::string& body, AntigravityUs
 
     for (const auto& [name, info] : *obj) {
         if (!ModelAllowed(name)) continue;
-        const auto* infoObj = info.AsObject();
-        if (!infoObj) continue;
-        auto* quota = infoObj->Find("quotaInfo");
-        if (!quota) continue;
-        const auto* quotaObj = quota->AsObject();
-        if (!quotaObj) continue;
+        if (!info.IsObject()) continue;
+        // Find() is a member of jsonlite::Value, not of the raw Object map.
+        const jsonlite::Value* quota = info.Find("quotaInfo");
+        if (!quota || !quota->IsObject()) continue;
 
         double remaining = 0.0;
-        if (auto* rf = quotaObj->Find("remainingFraction")) {
+        if (const jsonlite::Value* rf = quota->Find("remainingFraction")) {
             if (auto v = rf->AsNumber()) remaining = *v;
         }
         std::string reset;
-        if (auto* rt = quotaObj->Find("resetTime")) {
+        if (const jsonlite::Value* rt = quota->Find("resetTime")) {
             if (auto s = rt->AsString()) reset = std::string(*s);
         }
         AntigravityModelQuota mq;
