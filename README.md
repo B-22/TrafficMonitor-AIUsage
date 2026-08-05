@@ -281,7 +281,11 @@ Kiro Credits 通过 Kiro IDE 的本地登录态读取，无需手动填凭据：
   `https://api.ipify.org/`；HTTP 和重定向会被拒绝
 - `VerifyTargetHostExitIp=1`：在真实请求前访问同一目标域名的
   `/cdn-cgi/trace` 并读取 `ip=`，确保检测与 API 请求命中相同的域名分流规则；
-  Claude、Codex 和令牌刷新域名会分别检测
+  Claude、Codex 和令牌刷新域名会分别检测。
+  只有 Cloudflare 前置的域名提供 `/cdn-cgi/trace`，Antigravity（Google）和
+  Kiro（AWS）会返回 404。此时检测结果视为"不确定"，自动回退到
+  `ExitIpCheckUrl` 再校验一次；只有回退检测也失败，或检测到的出口 IP 明确
+  不在 `AllowedExitIPs` 中，才会 fail-closed 拦截请求
 
 推荐的 TUN 配置：
 

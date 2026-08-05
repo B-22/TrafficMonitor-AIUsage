@@ -156,19 +156,18 @@ std::wstring ExtractExitIp(const std::wstring& responseBody) {
     return {};
 }
 
-bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
-                  std::wstring* observedIp, std::wstring* errorMessage) {
-    if (observedIp) observedIp->clear();
-    if (errorMessage) errorMessage->clear();
-    if (config.allowedExitIps.empty()) return true;
+// Outcome of a single exit-IP probe.
+//   Match       - the endpoint answered and the exit IP is whitelisted.
+//   Mismatch    - the endpoint answered but the exit IP is NOT whitelisted.
+//   Unavailable - the endpoint could not be used at all (non-200, unparsable
+//                 body, network failure). This is distinct from Mismatch so
+//                 the caller can fall back to another probe URL instead of
+//                 blocking outright.
+enum class ExitIpProbe { Match, Mismatch, Unavailable };
 
-    std::wstring checkUrl = config.exitIpCheckUrl;
-    if (config.verifyTargetHost && targetHost && targetHost[0] != L'\0') {
-        checkUrl = L"https://";
-        checkUrl += targetHost;
-        checkUrl += L"/cdn-cgi/trace";
-    }
-
+static ExitIpProbe ProbeExitIpOnce(const ProxyConfig& config,
+                                   const std::wstring& checkUrl,
+                                   std::wstring* observedIp) {
     URL_COMPONENTS parts{};
     parts.dwStructSize = sizeof(parts);
     parts.dwSchemeLength = static_cast<DWORD>(-1);
@@ -177,8 +176,7 @@ bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
     parts.dwExtraInfoLength = static_cast<DWORD>(-1);
     if (!WinHttpCrackUrl(checkUrl.c_str(), 0, 0, &parts)
         || parts.nScheme != INTERNET_SCHEME_HTTPS || parts.dwHostNameLength == 0) {
-        if (errorMessage) *errorMessage = L"Exit IP check URL must be a valid HTTPS URL";
-        return false;
+        return ExitIpProbe::Unavailable;
     }
 
     const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
@@ -189,12 +187,9 @@ bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
     if (path.empty()) path = L"/";
 
     HINTERNET session = OpenRawSession(config, L"AIUsageExitIpCheck/1.0");
-    if (!session) {
-        if (errorMessage) *errorMessage = L"Exit IP check could not open HTTP session";
-        return false;
-    }
+    if (!session) return ExitIpProbe::Unavailable;
 
-    bool allowed = false;
+    ExitIpProbe outcome = ExitIpProbe::Unavailable;
     HINTERNET connect = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
     HINTERNET request = nullptr;
     if (connect) {
@@ -238,12 +233,14 @@ bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
                             std::vector<unsigned char> bytes;
                             if (ParseIp(current, &family, &bytes)) {
                                 if (observedIp) *observedIp = current;
-                                allowed = std::any_of(
+                                const bool whitelisted = std::any_of(
                                     config.allowedExitIps.begin(),
                                     config.allowedExitIps.end(),
                                     [&](const std::wstring& expected) {
                                         return IpEquals(current, expected);
                                     });
+                                outcome = whitelisted ? ExitIpProbe::Match
+                                                      : ExitIpProbe::Mismatch;
                             }
                         }
                         break;
@@ -257,16 +254,56 @@ bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
     if (request) WinHttpCloseHandle(request);
     if (connect) WinHttpCloseHandle(connect);
     WinHttpCloseHandle(session);
+    return outcome;
+}
 
-    if (!allowed && errorMessage) {
-        if (observedIp && !observedIp->empty()) {
-            *errorMessage = L"BLOCKED: exit IP " + *observedIp
-                + L" is not in AllowedExitIPs";
-        } else {
-            *errorMessage = L"BLOCKED: could not verify the public exit IP";
+bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
+                  std::wstring* observedIp, std::wstring* errorMessage) {
+    if (observedIp) observedIp->clear();
+    if (errorMessage) errorMessage->clear();
+    if (config.allowedExitIps.empty()) return true;
+
+    // Preferred probe: ask the very host we are about to call, so the check
+    // follows the same proxy/TUN split-routing rule as the real request.
+    // Only Cloudflare-fronted hosts serve /cdn-cgi/trace though - Google
+    // (Antigravity) and AWS (Kiro) answer 404, which would otherwise
+    // fail-closed forever. Treat "endpoint unusable" as inconclusive and
+    // fall back to the generic ExitIpCheckUrl instead of blocking.
+    if (config.verifyTargetHost && targetHost && targetHost[0] != L'\0') {
+        std::wstring traceUrl = L"https://";
+        traceUrl += targetHost;
+        traceUrl += L"/cdn-cgi/trace";
+        switch (ProbeExitIpOnce(config, traceUrl, observedIp)) {
+            case ExitIpProbe::Match:
+                return true;
+            case ExitIpProbe::Mismatch:
+                if (errorMessage) {
+                    *errorMessage = L"BLOCKED: exit IP " + *observedIp
+                        + L" is not in AllowedExitIPs";
+                }
+                return false;
+            case ExitIpProbe::Unavailable:
+                break;  // inconclusive - try the generic endpoint
         }
     }
-    return allowed;
+
+    switch (ProbeExitIpOnce(config, config.exitIpCheckUrl, observedIp)) {
+        case ExitIpProbe::Match:
+            return true;
+        case ExitIpProbe::Mismatch:
+            if (errorMessage) {
+                *errorMessage = L"BLOCKED: exit IP " + *observedIp
+                    + L" is not in AllowedExitIPs";
+            }
+            return false;
+        case ExitIpProbe::Unavailable:
+            break;
+    }
+
+    if (errorMessage) {
+        *errorMessage = L"BLOCKED: could not verify the public exit IP";
+    }
+    return false;
 }
 
 HINTERNET OpenHttpSession(const ProxyConfig& config, const wchar_t* userAgent,
