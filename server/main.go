@@ -29,17 +29,33 @@ type config struct {
 	claudeClientID string
 	tlsCert        string
 	tlsKey         string
+
+	// Reuse Claude Code / Codex CLI credentials found on the server host
+	// (~/.claude/.credentials.json, ~/.codex/auth.json). Local credentials
+	// take priority; uploaded ones are the fallback.
+	useLocalCreds bool
+
+	// Antigravity (Google Cloud Code). The client id/secret are installed-app
+	// credentials and default to the values baked into the Antigravity IDE;
+	// they are not secrets in the confidential-client sense.
+	antigravityClientID     string
+	antigravityClientSecret string
+	antigravityTokenFile    string
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		listen:         envOr("AIUSAGE_LISTEN", "127.0.0.1:8444"),
-		cacheUsage:     time.Duration(envIntOr("AIUSAGE_CACHE_USAGE", 45)) * time.Second,
-		cacheCredits:   time.Duration(envIntOr("AIUSAGE_CACHE_CREDITS", 300)) * time.Second,
-		cacheProfile:   time.Duration(envIntOr("AIUSAGE_CACHE_PROFILE", 3600)) * time.Second,
-		claudeClientID: envOr("AIUSAGE_CLAUDE_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
-		tlsCert:        os.Getenv("AIUSAGE_TLS_CERT"),
-		tlsKey:         os.Getenv("AIUSAGE_TLS_KEY"),
+		listen:                  envOr("AIUSAGE_LISTEN", "127.0.0.1:8444"),
+		cacheUsage:              time.Duration(envIntOr("AIUSAGE_CACHE_USAGE", 45)) * time.Second,
+		cacheCredits:            time.Duration(envIntOr("AIUSAGE_CACHE_CREDITS", 300)) * time.Second,
+		cacheProfile:            time.Duration(envIntOr("AIUSAGE_CACHE_PROFILE", 3600)) * time.Second,
+		claudeClientID:          envOr("AIUSAGE_CLAUDE_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+		tlsCert:                 os.Getenv("AIUSAGE_TLS_CERT"),
+		tlsKey:                  os.Getenv("AIUSAGE_TLS_KEY"),
+		useLocalCreds:           envBoolOr("AIUSAGE_USE_LOCAL_CREDS", true),
+		antigravityClientID:     envOr("AIUSAGE_AG_CLIENT_ID", agDefaultClientID),
+		antigravityClientSecret: envOr("AIUSAGE_AG_CLIENT_SECRET", ""),
+		antigravityTokenFile:    envOr("AIUSAGE_AG_TOKEN_FILE", "aiusage-antigravity.json"),
 	}
 	cfg.token = os.Getenv("AIUSAGE_TOKEN")
 	if cfg.token == "" {
@@ -51,6 +67,20 @@ func loadConfig() (config, error) {
 func envOr(name, def string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
+	}
+	return def
+}
+
+func envBoolOr(name string, def bool) bool {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 	return def
 }
@@ -75,6 +105,10 @@ type credentials struct {
 	codexAccess    string
 	codexRefresh   string
 	codexAccountID string
+
+	antigravityAccess    string
+	antigravityRefresh   string
+	antigravityExpiresAt int64
 }
 
 func (c *credentials) setClaude(access, refresh string) {
@@ -142,22 +176,37 @@ type tokenRefreshInfo struct {
 type server struct {
 	cfg   config
 	creds credentials
+	local *localCreds
 	mu    sync.Mutex
 	cache map[string]*cachedResponse
 	http  *http.Client
+
+	// Token-refresh endpoints (overridable in tests).
+	claudeTokenURLs []string
+	codexTokenURL   string
 }
 
 func newServer(cfg config) *server {
-	return &server{
-		cfg:   cfg,
-		cache: make(map[string]*cachedResponse),
-		http: &http.Client{
-			Timeout: 25 * time.Second,
-			Transport: &http.Transport{
-				Proxy: nil, // force direct egress (system route, e.g. residential IPv6)
-			},
+	hc := &http.Client{
+		Timeout: 25 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil, // force direct egress (system route, e.g. residential IPv6)
 		},
 	}
+	s := &server{
+		cfg:   cfg,
+		cache: make(map[string]*cachedResponse),
+		http:  hc,
+		claudeTokenURLs: []string{
+			"https://platform.claude.com/v1/oauth/token",
+			"https://console.anthropic.com/v1/oauth/token",
+		},
+		codexTokenURL: "https://auth.openai.com/oauth/token",
+	}
+	if cfg.useLocalCreds {
+		s.local = newLocalCreds(cfg, hc)
+	}
+	return s
 }
 
 // checkAuth rejects requests without a valid server bearer token.
@@ -256,7 +305,7 @@ func (s *server) handleEndpoint(e upstreamEndpoint) http.HandlerFunc {
 }
 
 func (s *server) fetchWithRetry(e upstreamEndpoint) (int, []byte, *tokenRefreshInfo) {
-	access := s.accessToken(e.provider)
+	access, src := s.accessTokenWithSource(e.provider)
 	if access == "" {
 		return http.StatusUnauthorized, []byte(`{"error":"no credentials uploaded"}`), nil
 	}
@@ -271,21 +320,54 @@ func (s *server) fetchWithRetry(e upstreamEndpoint) (int, []byte, *tokenRefreshI
 		return status, body, nil
 	}
 	status, body = s.doUpstream(e, newAccess)
-	return status, body, &tokenRefreshInfo{
-		Provider:     e.provider,
-		AccessToken:  newAccess,
-		RefreshToken: newRefresh,
-		ExpiresAt:    expiresAt,
+	// Only uploaded credentials are reported back to the plugin for
+	// persistence. Locally-managed CLI credentials are refreshed and written
+	// back to their own files by the server, so no header is needed.
+	if src == credSourceUploaded {
+		return status, body, &tokenRefreshInfo{
+			Provider:     e.provider,
+			AccessToken:  newAccess,
+			RefreshToken: newRefresh,
+			ExpiresAt:    expiresAt,
+		}
 	}
+	return status, body, nil
+}
+
+// credentialSource tells where the active access token came from.
+type credentialSource int
+
+const (
+	credSourceUploaded credentialSource = iota
+	credSourceLocal
+)
+
+// accessTokenWithSource returns the best available access token for the
+// provider. Local CLI credentials (when enabled) take priority; uploaded
+// credentials are the fallback.
+func (s *server) accessTokenWithSource(provider string) (string, credentialSource) {
+	if s.local != nil {
+		if provider == "claude" {
+			if tok, ok := s.local.claudeToken(); ok {
+				return tok, credSourceLocal
+			}
+		} else {
+			if tok, ok := s.local.codexToken(); ok {
+				return tok, credSourceLocal
+			}
+		}
+	}
+	if provider == "claude" {
+		access, _ := s.creds.claude()
+		return access, credSourceUploaded
+	}
+	access, _, _ := s.creds.codex()
+	return access, credSourceUploaded
 }
 
 func (s *server) accessToken(provider string) string {
-	if provider == "claude" {
-		access, _ := s.creds.claude()
-		return access
-	}
-	access, _, _ := s.creds.codex()
-	return access
+	tok, _ := s.accessTokenWithSource(provider)
+	return tok
 }
 
 func (s *server) doUpstream(e upstreamEndpoint, access string) (int, []byte) {
@@ -386,15 +468,35 @@ func (s *server) handleCacheExpiry() {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
+
+	// `aiusage-server ag-login` runs the one-time Antigravity authorization
+	// from the terminal and exits. It does not serve traffic, so the shared
+	// bearer token is irrelevant in that mode.
+	loginMode := len(os.Args) > 1 && os.Args[1] == "ag-login"
+	if loginMode && os.Getenv("AIUSAGE_TOKEN") == "" {
+		_ = os.Setenv("AIUSAGE_TOKEN", "unused-during-ag-login")
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
 
 	s := newServer(cfg)
+
+	if loginMode {
+		if err := s.runAntigravityLogin(); err != nil {
+			log.Fatalf("ag-login: %v", err)
+		}
+		return
+	}
+
+	s.bootstrapAntigravity()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/credentials", s.handleCredentials)
+	mux.HandleFunc("/api/v1/antigravity/quota", s.handleAntigravityQuota)
 
 	mux.Handle("/api/v1/claude/usage", s.handleEndpoint(upstreamEndpoint{
 		cacheKey: "claude:usage",
@@ -432,6 +534,7 @@ func main() {
 			"OpenAI-Beta": "codex-1",
 			"originator":  "Codex Desktop",
 		},
+		needsRefresh: refreshCodexToken,
 	}))
 	mux.Handle("/api/v1/codex/credits", s.handleEndpoint(upstreamEndpoint{
 		cacheKey: "codex:credits",
@@ -443,6 +546,7 @@ func main() {
 			"OpenAI-Beta": "codex-1",
 			"originator":  "Codex Desktop",
 		},
+		needsRefresh: refreshCodexToken,
 	}))
 
 	go s.handleCacheExpiry()

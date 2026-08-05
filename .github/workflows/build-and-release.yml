@@ -62,7 +62,6 @@ jobs:
           cmake
           -S .
           -B build/${{ matrix.display_name }}
-          -G "Visual Studio 18 2026"
           -A ${{ matrix.cmake_arch }}
           -DCMAKE_BUILD_TYPE=Release
           "-DCODEX_USAGE_VERSION=${{ steps.version.outputs.version }}"
@@ -90,9 +89,60 @@ jobs:
           path: ${{ matrix.artifact_name }}.zip
           if-no-files-found: error
 
+  server:
+    name: Build Go forwarder
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: server/go.mod
+
+      - name: Test server
+        working-directory: server
+        run: go test ./...
+
+      - name: Vet server
+        working-directory: server
+        run: go vet ./...
+
+      - name: Test ag-login
+        working-directory: tools/ag-login
+        run: go test ./...
+
+      - name: Create release-assets dir
+        run: mkdir -p release-assets
+
+      - name: Build server (linux amd64)
+        working-directory: server
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o ../release-assets/aiusage-server-linux-amd64 .
+
+      - name: Build server (linux arm64)
+        working-directory: server
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o ../release-assets/aiusage-server-linux-arm64 .
+
+      - name: Build server (windows amd64)
+        working-directory: server
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o ../release-assets/aiusage-server-windows-amd64.exe .
+
+      - name: Build ag-login (windows amd64)
+        working-directory: tools/ag-login
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o ../../release-assets/ag-login.exe .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: AIUsage-server
+          path: release-assets/*
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, server]
     runs-on: windows-latest
     # 允许标签推送或 main 分支推送时执行
     if: (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) || (github.ref_name == 'main')
@@ -151,6 +201,10 @@ jobs:
               release-assets\AIUsage-x86.zip `
               release-assets\AIUsage-x64.zip `
               release-assets\AIUsage-arm64.zip `
+              release-assets\aiusage-server-linux-amd64 `
+              release-assets\aiusage-server-linux-arm64 `
+              release-assets\aiusage-server-windows-amd64.exe `
+              release-assets\ag-login.exe `
               --repo $env:GITHUB_REPOSITORY `
               --title ${{ steps.release-tag.outputs.tag }} `
               --generate-notes

@@ -144,13 +144,13 @@ Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过
 
 ### Antigravity 凭据
 
-插件通过 Google OAuth 读取 Antigravity（Google Cloud Code）模型配额，凭据填写在 `AIUsage.ini` 的 `[Antigravity]` 段：
+插件通过 Google OAuth 读取 Antigravity（Google Cloud Code）模型配额。**推荐方式**：双击 TrafficMonitor 目录下的 `ag-login.exe`（部署脚本会自动放置），浏览器自动打开 Google 登录页，授权完成后令牌自动写回 `AIUsage.ini` 的 `[Antigravity]` 段，之后插件自行刷新，无需任何手工维护。也可以手动填写：
 
 | 配置键 | 必填 | 说明 |
 |--------|------|------|
-| `ClientId` | 否 | 默认使用公开的 Cloud Code installed-app 客户端，无需填写 |
-| `ClientSecret` | 是 | 登录 Antigravity 时使用的 OAuth client secret |
-| `AccessToken` | 二选一 | 已签发的 access token（过期后需手动更换） |
+| `ClientId` | 否 | 默认使用公开的 Cloud Code installed-app 客户端，留空即用内置值 |
+| `ClientSecret` | 否 | 已内置默认值（Google 视 installed-app secret 为非机密，参考项目同样明文内置），留空即用内置值 |
+| `AccessToken` | 二选一 | 已签发的 access token（过期后需重新运行 ag-login.exe） |
 | `RefreshToken` | 二选一（推荐） | 自动刷新 access token，无需手工维护 |
 | `PrimaryModel` | 否 | 任务栏圆环的"主模型"（子串匹配），留空自动选择 |
 
@@ -251,7 +251,7 @@ Kiro Credits 通过 Kiro IDE 的本地登录态读取，无需手动填凭据：
 - `~/.codex/auth.json`（支持 token 刷新和写回）
 
 **Antigravity**：
-- `AIUsage.ini` 的 `[Antigravity]` 段（ClientSecret + RefreshToken 推荐）
+- `AIUsage.ini` 的 `[Antigravity]` 段（推荐运行 `ag-login.exe` 一键授权写回，也可手动填 RefreshToken）
 - 自动通过 `oauth2.googleapis.com/token` 刷新 access token，不修改本地文件
 
 **Kiro**：
@@ -283,9 +283,10 @@ Kiro Credits 通过 Kiro IDE 的本地登录态读取，无需手动填凭据：
   `/cdn-cgi/trace` 并读取 `ip=`，确保检测与 API 请求命中相同的域名分流规则；
   Claude、Codex 和令牌刷新域名会分别检测。
   只有 Cloudflare 前置的域名提供 `/cdn-cgi/trace`，Antigravity（Google）和
-  Kiro（AWS）会返回 404。此时检测结果视为"不确定"，自动回退到
-  `ExitIpCheckUrl` 再校验一次；只有回退检测也失败，或检测到的出口 IP 明确
-  不在 `AllowedExitIPs` 中，才会 fail-closed 拦截请求
+  Kiro（AWS）会返回 404。此时采用**宽松策略：默认放行**，不再回退到
+  `ExitIpCheckUrl` 探测——因为不同域名走不同分流规则，回退探测会把
+  误报的出口 IP 当成真实出口，反而导致误拦。仅当检测到的出口 IP 明确不在
+  `AllowedExitIPs` 中时才会 fail-closed 拦截
 
 推荐的 TUN 配置：
 
@@ -343,11 +344,11 @@ AllowedExitIPs=        # 精确公网 IP 白名单，非空即启用 fail-closed
 ExitIpCheckUrl=https://api.ipify.org/
 VerifyTargetHostExitIp=1
 
-[Antigravity]          # Google OAuth 凭据，仅存本机
-ClientId=
-ClientSecret=
-AccessToken=
-RefreshToken=
+[Antigravity]          # Google OAuth 凭据，仅存本机（双击 ag-login.exe 一键授权写回）
+ClientId=              # 留空 = 内置默认 Cloud Code 客户端
+ClientSecret=          # 留空 = 内置默认值（Google 视 installed-app secret 为非机密）
+AccessToken=           # ag-login.exe 自动写回；也可手动填
+RefreshToken=          # ag-login.exe 自动写回；推荐，用于自动续期
 PrimaryModel=          # 主模型子串，留空自动选择
 
 [Kiro]                 # Kiro IDE 登录态
@@ -365,6 +366,13 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 产物：`build/Release/AIUsagePreview.dll`
+
+GitHub Actions 发版（tag `v*` / main 推送）自动附带以下产物：
+- `AIUsage-{x86,x64,arm64}.zip`：插件 DLL + `AIUsage.ini` 模板
+- `aiusage-server-linux-amd64` / `aiusage-server-linux-arm64`：Go 转发服务
+  （静态二进制，部署到 Linux 服务器直接运行）
+- `aiusage-server-windows-amd64.exe`：Go 转发服务 Windows 版
+- `ag-login.exe`：Antigravity 一次性授权工具（放到 TrafficMonitor 目录双击即可）
 
 ### 部署
 
@@ -386,14 +394,29 @@ DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本�
 一次性上传给该服务，由服务在自身网络出口（如家宽 IPv6）上代请求官方用量接口，
 再回传给插件。这样插件所在机器的出口 IP 不会暴露给官方 API。
 
-- 构建：`cd server && go build`
+- 构建：`cd server && go build`；交叉编译 Linux 静态二进制：
+  `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build`（arm64 同理，产物约 7MB）
 - 配置全部通过环境变量，至少需要 `AIUSAGE_TOKEN`（服务间共享的 bearer token）
 - 环境变量：`AIUSAGE_LISTEN`（默认 `127.0.0.1:8444`）、`AIUSAGE_CACHE_USAGE`
   /`AIUSAGE_CACHE_CREDITS`/`AIUSAGE_CACHE_PROFILE`（缓存秒数）、
   `AIUSAGE_CLAUDE_CLIENT_ID`（默认公开的 Cloud Code 客户端）、
   `AIUSAGE_TLS_CERT`/`AIUSAGE_TLS_KEY`（可选 TLS）
-- 凭据只保存在服务进程内存，不落盘；所有端点都要求 bearer token 认证
+- 上传的凭据只保存在服务进程内存，不落盘；所有端点都要求 bearer token 认证
 - 测试：`go test ./...`
+
+**Linux 上复用本机 CLI 登录态（默认开启）**：若服务器上跑过
+`claude` / `codex` 登录，服务会直接读取并复用本地凭证，无需再上传：
+
+- Claude：读 `~/.claude/.credentials.json`（`claudeAiOauth` 段），
+  尊重 `CLAUDE_CONFIG_DIR` 环境变量
+- Codex：读 `~/.codex/auth.json`（`tokens` 段），尊重 `CODEX_HOME` 环境变量；
+  API Key 计费模式（无 `tokens`）没有订阅限额可查
+- 令牌临近过期（<120s）或被上游 401 拒绝时，服务用其中的 refreshToken 自动
+  续期并**原子写回原文件（0600）**——与 CLI 行为一致，登录一次即永久自续
+- 优先级：本地凭证优先，插件上传的凭据作为回退；`AIUSAGE_USE_LOCAL_CREDS=0`
+  可关闭本地复用，恢复纯转发模式
+- 实现语义对齐 [huanchong-99/claude-usage-assistant](https://github.com/huanchong-99/claude-usage-assistant)
+  （参考脚本归档于 `docs/reference/quota_card.py`）
 
 默认插件仍是直连官方 API，不使用该服务；仅当部署该服务并配置插件指向它时才会
 用到。

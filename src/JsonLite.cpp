@@ -293,6 +293,48 @@ std::optional<std::string> Parser::ParseString() {
                     }
                     pos_ += 4;
 
+                    if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+                        // High surrogate: combine with a following \uXXXX low surrogate
+                        if (pos_ + 6 <= text_.size() && text_[pos_] == '\\' && text_[pos_ + 1] == 'u') {
+                            unsigned int low = 0;
+                            bool ok = true;
+                            for (size_t i = 0; i < 4 && ok; ++i) {
+                                const char hex = text_[pos_ + 2 + i];
+                                low <<= 4;
+                                if (hex >= '0' && hex <= '9') {
+                                    low |= static_cast<unsigned int>(hex - '0');
+                                } else if (hex >= 'a' && hex <= 'f') {
+                                    low |= static_cast<unsigned int>(hex - 'a' + 10);
+                                } else if (hex >= 'A' && hex <= 'F') {
+                                    low |= static_cast<unsigned int>(hex - 'A' + 10);
+                                } else {
+                                    ok = false;
+                                }
+                            }
+                            if (ok && low >= 0xDC00 && low <= 0xDFFF) {
+                                pos_ += 6;
+                                const unsigned int cp = 0x10000 +
+                                    ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                                output.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+                                output.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                                output.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                                output.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                                break;
+                            }
+                        }
+                        // Lone surrogate: emit U+FFFD replacement char
+                        output.push_back(static_cast<char>(0xEF));
+                        output.push_back(static_cast<char>(0xBF));
+                        output.push_back(static_cast<char>(0xBD));
+                        break;
+                    }
+                    if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+                        // Lone low surrogate: emit U+FFFD replacement char
+                        output.push_back(static_cast<char>(0xEF));
+                        output.push_back(static_cast<char>(0xBF));
+                        output.push_back(static_cast<char>(0xBD));
+                        break;
+                    }
                     if (codepoint <= 0x7F) {
                         output.push_back(static_cast<char>(codepoint));
                     } else if (codepoint <= 0x7FF) {

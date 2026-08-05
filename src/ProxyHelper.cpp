@@ -197,7 +197,7 @@ static ExitIpProbe ProbeExitIpOnce(const ProxyConfig& config,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     }
     if (request) {
-        constexpr DWORD timeout = 8000;
+        constexpr DWORD timeout = 5000;
         WinHttpSetTimeouts(request, timeout, timeout, timeout, timeout);
         DWORD disableRedirects = WINHTTP_DISABLE_REDIRECTS;
         WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE,
@@ -266,9 +266,7 @@ bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
     // Preferred probe: ask the very host we are about to call, so the check
     // follows the same proxy/TUN split-routing rule as the real request.
     // Only Cloudflare-fronted hosts serve /cdn-cgi/trace though - Google
-    // (Antigravity) and AWS (Kiro) answer 404, which would otherwise
-    // fail-closed forever. Treat "endpoint unusable" as inconclusive and
-    // fall back to the generic ExitIpCheckUrl instead of blocking.
+    // (Antigravity) and AWS (Kiro) answer 404.
     if (config.verifyTargetHost && targetHost && targetHost[0] != L'\0') {
         std::wstring traceUrl = L"https://";
         traceUrl += targetHost;
@@ -283,10 +281,20 @@ bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
                 }
                 return false;
             case ExitIpProbe::Unavailable:
-                break;  // inconclusive - try the generic endpoint
+                // LENIENT policy (user preference): when the target host does
+                // not expose /cdn-cgi/trace (Google/Antigravity, AWS/Kiro),
+                // trust its own split-routing rule and allow instead of
+                // falling back to the generic exit-IP service. That fallback
+                // follows a DIFFERENT proxy rule (different hostname) and
+                // would misreport the real egress of the API request.
+                if (observedIp) observedIp->clear();
+                if (errorMessage) errorMessage->clear();
+                return true;
         }
     }
 
+    // Only reached when verifyTargetHost is disabled or no target host was
+    // given: probe the generic exit-IP service explicitly.
     switch (ProbeExitIpOnce(config, config.exitIpCheckUrl, observedIp)) {
         case ExitIpProbe::Match:
             return true;
@@ -345,7 +353,7 @@ static bool ProbeHost(const wchar_t* host, INTERNET_PORT port, const wchar_t* pa
         HINTERNET request = WinHttpOpenRequest(connect, L"HEAD", path, nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
         if (request) {
-            WinHttpSetTimeouts(request, 8000, 8000, 8000, 10000);
+            WinHttpSetTimeouts(request, 5000, 5000, 5000, 5000);
             if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                     WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
                 if (WinHttpReceiveResponse(request, nullptr)) {

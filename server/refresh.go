@@ -9,17 +9,25 @@ import (
 	"time"
 )
 
-const (
-	claudeTokenHost1 = "platform.claude.com"
-	claudeTokenHost2 = "console.anthropic.com"
-	claudeTokenPath  = "/v1/oauth/token"
-)
-
 // refreshClaudeToken exchanges the stored refresh token for a fresh access
 // token, updates the in-memory credentials and invalidates cached upstream
 // data so the next request uses the new token. Returns the new access token,
 // the (possibly rotated) refresh token and its expiry time.
+//
+// Local CLI credentials (when enabled) are refreshed first; uploaded
+// credentials are used otherwise.
 func refreshClaudeToken(s *server) (string, string, int64, error) {
+	if s.local != nil {
+		if _, ok := s.local.claudeToken(); ok {
+			access, newRefresh, expiresAt, err := s.local.refreshClaude()
+			if err == nil {
+				s.invalidateCache()
+				return access, newRefresh, expiresAt, nil
+			}
+			// Local refresh failed: fall back to uploaded credentials below.
+		}
+	}
+
 	_, refresh := s.creds.claude()
 	if refresh == "" {
 		return "", "", 0, errors.New("claude: no refresh token uploaded")
@@ -36,8 +44,8 @@ func refreshClaudeToken(s *server) (string, string, int64, error) {
 	}
 
 	var lastErr error
-	for _, host := range []string{claudeTokenHost1, claudeTokenHost2} {
-		token, newRefresh, expiresAt, err := s.claudeTokenExchange(host, payload)
+	for _, u := range s.claudeTokenURLs {
+		token, newRefresh, expiresAt, err := s.claudeTokenExchange(u, payload)
 		if err != nil {
 			lastErr = err
 			continue
@@ -52,9 +60,46 @@ func refreshClaudeToken(s *server) (string, string, int64, error) {
 	return "", "", 0, lastErr
 }
 
-func (s *server) claudeTokenExchange(host string, payload []byte) (string, string, int64, error) {
+// refreshCodexToken refreshes the Codex access token. Local CLI credentials
+// (when enabled) are refreshed first and written back to auth.json; uploaded
+// credentials are the fallback.
+func refreshCodexToken(s *server) (string, string, int64, error) {
+	if s.local != nil {
+		if _, ok := s.local.codexToken(); ok {
+			access, newRefresh, expiresAt, err := s.local.refreshCodex()
+			if err == nil {
+				s.invalidateCache()
+				return access, newRefresh, expiresAt, nil
+			}
+			// Local refresh failed: fall back to uploaded credentials below.
+		}
+	}
+
+	access, refresh, accountID := s.creds.codex()
+	if access == "" || refresh == "" {
+		return "", "", 0, errors.New("codex: no refresh token uploaded")
+	}
+	payload, err := json.Marshal(map[string]string{
+		"client_id":     codexLocalClientID,
+		"grant_type":    "refresh_token",
+		"refresh_token": refresh,
+	})
+	if err != nil {
+		return "", "", 0, err
+	}
+	newAccess, newRefresh, expiresAt, err := tokenExchangeWith(
+		s.http, s.codexTokenURL, payload, codexLocalUA)
+	if err != nil {
+		return "", "", 0, err
+	}
+	s.creds.setCodex(newAccess, newRefresh, accountID)
+	s.invalidateCache()
+	return newAccess, newRefresh, expiresAt, nil
+}
+
+func (s *server) claudeTokenExchange(endpoint string, payload []byte) (string, string, int64, error) {
 	req, err := http.NewRequest(http.MethodPost,
-		"https://"+host+claudeTokenPath, bytes.NewReader(payload))
+		endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return "", "", 0, err
 	}

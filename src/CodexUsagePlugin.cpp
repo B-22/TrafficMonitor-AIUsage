@@ -19,13 +19,18 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cwchar>
 #include <ctime>
 #include <cwctype>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <regex>
+#include <set>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <utility>
 
 #pragma comment(lib, "gdiplus.lib")
@@ -475,10 +480,51 @@ std::wstring FormatSubscriptionStatus(const DashData& data) {
     return L"--";
 }
 
+// Normalize an Antigravity tier id to a display label. Internal identifiers
+// (e.g. "g1-pro-tier") are not user-meaningful and return empty, so callers
+// hide them instead of showing raw API values.
+std::wstring FormatAgTier(const std::string& tier) {
+    std::string t = tier;
+    std::transform(t.begin(), t.end(), t.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (t == "free") return L"FREE";
+    if (t == "pro") return L"PRO";
+    if (t == "teams" || t == "team") return L"TEAMS";
+    if (t == "enterprise") return L"ENT";
+    return L"";
+}
+
 // Pick the model that drives the Antigravity ring. When PrimaryModel is
 // configured it wins (substring match on the raw key); falling back to the
 // highest-priority pool (Gemini 3.x > Claude > GPT), broken to the
 // most-exhausted model so the ring reflects the tightest quota.
+// Gemini version comparison helpers for the tooltip's per-family dedup.
+// "Gemini 3.6 Flash High" -> version 36, family "Flash".
+// "Gemini 3 Flash"       -> version 30, family "Flash".
+// Non-Gemini models return version -1.
+int GeminiModelVersion(const std::string& displayName) {
+    std::smatch m;
+    if (std::regex_search(displayName, m,
+            std::regex(R"(^Gemini\s+(\d+)(?:\.(\d+))?)"))) {
+        const int major = std::atoi(m[1].str().c_str());
+        const int minor = m[2].matched ? std::atoi(m[2].str().c_str()) : 0;
+        return major * 10 + minor;
+    }
+    return -1;
+}
+
+// The variant family is the FIRST word after the version ("Flash High" and
+// "Flash Lite" both belong to "Flash"), so dedup keeps only the newest
+// version of each family (user preference: Flash/Pro 各留最新版).
+std::string GeminiModelFamily(const std::string& displayName) {
+    std::smatch m;
+    if (std::regex_search(displayName, m,
+            std::regex(R"(^Gemini\s+\d+(?:\.\d+)?\s*([A-Za-z]+))"))) {
+        return m[1].str();
+    }
+    return displayName;
+}
+
 int AntigravityModelPriority(const std::string& name) {
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
@@ -720,9 +766,8 @@ public:
                      snap.c5Reset.empty() ? L"--" : IsoToLocalTimeW(snap.c5Reset));
         }
         if (opts.showAntigravity) {
-            const std::wstring tier = snap.agTier.empty()
-                ? L"--" : ToWide(snap.agTier);
-            addBlock(L"AG", tier.c_str());
+            const std::wstring tier = FormatAgTier(snap.agTier);
+            if (!tier.empty()) addBlock(L"AG", tier.c_str());
         }
         if (opts.showKiro) {
             addBlock(L"Kiro", FormatKiroRemaining(snap).c_str());
@@ -1074,9 +1119,8 @@ public:
         }
 
         if (opts.showAntigravity) {
-            const std::wstring tier = snap.agTier.empty()
-                ? L"--" : ToWide(snap.agTier);
-            block(L"AG", tier.c_str());
+            const std::wstring tier = FormatAgTier(snap.agTier);
+            if (!tier.empty()) block(L"AG", tier.c_str());
         }
 
         if (opts.showKiro) {
@@ -1210,6 +1254,39 @@ public:
 
     IPluginItem* GetItem(int i) override { return i == 0 ? &dash_ : nullptr; }
 
+    // Releases the fetch-cycle lock. Called at the end of every worker path
+    // (normal completion and early-stop), so busy_ is always cleared.
+    void FinishFetch() {
+        std::lock_guard<std::mutex> lk(mu_);
+        busy_ = false;
+    }
+
+    // Signals the background fetch worker to stop and joins it. Called from
+    // DllMain on DLL_PROCESS_DETACH so a stalled worker thread cannot keep the
+    // host process alive after exit (the residual-process bug).
+    //
+    // The wait is BOUNDED and lock-free: in DllMain (loader lock held) any
+    // sync primitive (mutex/condition_variable) is risky, so we poll the
+    // worker's completion flag with a pure sleep. If the worker is in the
+    // middle of an in-flight request (each WinHttp call has a 5s timeout, a
+    // fetch can chain several), an unbounded join() would delay process exit
+    // for up to ~10-15s. On host process exit the OS reclaims every thread,
+    // so we never block indefinitely.
+    void Shutdown() {
+        stop_.store(true);
+        if (!worker_.joinable()) return;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!workerExited_.load()
+               && std::chrono::steady_clock::now() < deadline) {
+            ::Sleep(50);
+        }
+        if (workerExited_.load() && worker_.joinable()) {
+            worker_.join(); // thread already finished; instant
+        }
+        // In-flight case: return without joining; process exit reclaims it.
+    }
+
     void DataRequired() override {
         auto now = std::chrono::steady_clock::now();
         bool applyPendingConfig = false;
@@ -1238,11 +1315,24 @@ public:
             refreshing.refreshInProgress = true;
             dash_.SetSnapshot(refreshing);
         }
-        std::thread([this]() {
+        // Join any previously finished worker before starting a new one.
+        // Assigning a new std::thread to a joinable worker would call
+        // std::terminate via the move-assignment destructor, so we must join
+        // first. The previous worker has already cleared busy_ by the time we
+        // reach here, so joining a finished thread is instantaneous.
+        if (worker_.joinable()) worker_.join();
+        worker_ = std::thread([this]() {
+            auto markDone = [&]() {
+                workerExited_.store(true);
+            };
             auto claude = claude_.Fetch();
+            if (stop_.load()) { FinishFetch(); markDone(); return; }
             auto codex = codex_.Fetch();
+            if (stop_.load()) { FinishFetch(); markDone(); return; }
             auto ag = ag_.Fetch();
+            if (stop_.load()) { FinishFetch(); markDone(); return; }
             auto kiro = kiro_.Fetch();
+            if (stop_.load()) { FinishFetch(); markDone(); return; }
             DashData d = dash_.GetSnapshot();
             const double t = static_cast<double>(time(nullptr));
             if (claude.success) {
@@ -1309,10 +1399,13 @@ public:
             }
             d.refreshInProgress = false;
             dash_.SetSnapshot(d);
-            std::lock_guard<std::mutex> lk(mu_);
-            tip_ = BuildTip(claude, codex, ag, kiro);
-            busy_ = false;
-        }).detach();
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                tip_ = BuildTip(claude, codex, ag, kiro);
+            }
+            FinishFetch();
+            markDone();
+        });
     }
 
     const wchar_t* GetInfo(PluginInfoIndex i) override {
@@ -1328,8 +1421,16 @@ public:
     }
 
     const wchar_t* GetTooltipInfo() override {
+        // Copy into a FIXED-ADDRESS buffer. tooltipOut_ used to be a
+        // std::wstring member that reallocated on every call; if the host
+        // keeps the returned pointer across calls (instead of copying it
+        // immediately), the old pointer dangles as soon as the next data
+        // update refreshes the tip — reading freed memory surfaces as random
+        // Win32 failures (e.g. ERROR_INVALID_PARAMETER once data arrives).
+        // The fixed array never moves and bounds the length at the same time.
         std::lock_guard<std::mutex> lk(mu_);
-        return tip_.c_str();
+        wcsncpy_s(tooltipBuf_, tip_.c_str(), _TRUNCATE);
+        return tooltipBuf_;
     }
 
     OptionReturn ShowOptionsDialog(void* hParent) override {
@@ -1463,7 +1564,7 @@ public:
             L"  ResetRadarRefreshMinutes=15\n"
             L"  RunwayResetRefreshMinutes=60\n"
             L"  ShowAntigravity=1\n"
-            L"  ShowKiro=1\n"
+            L"  ShowKiro=0\n"
             L"  CustomSubExpiry=\n"
             L"  ProxyServer=\n"
             L"  RequireProxy=1\n"
@@ -1508,7 +1609,7 @@ public:
             snap.x5, snap.x7,
             x7ResetBuf,
             snap.agPct,
-            snap.agTier.empty() ? L"--" : std::wstring(snap.agTier.begin(), snap.agTier.end()).c_str(),
+            FormatAgTier(snap.agTier).empty() ? L"--" : FormatAgTier(snap.agTier).c_str(),
             snap.kiroPct, snap.kiroRemaining,
             snap.resetCreditCount,
             resetCreditExpiry.c_str(),
@@ -1628,7 +1729,7 @@ private:
         o.showAntigravity = (buf[0] == L'1');
 
         GetPrivateProfileStringW(
-            L"AIUsage", L"ShowKiro", L"1",
+            L"AIUsage", L"ShowKiro", L"0",
             buf, 256, iniPath.c_str());
         o.showKiro = (buf[0] == L'1');
 
@@ -1747,36 +1848,60 @@ private:
     std::wstring BuildTip(const ClaudeUsageData& c, const UsageSnapshot& x,
                           const AntigravityUsageData& ag,
                           const KiroCreditsData& kiro) const {
-        std::wstring t = L"AI Usage\n";
-        t += L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n";
-        t += L"\u914D\u989D\n";
+        // 10-cell ASCII progress bar: [##########] (any font, no width math)
+        auto bar = [](int remaining) -> std::wstring {
+            int filled = std::clamp((remaining + 5) / 10, 0, 10); // round 0..10
+            std::wstring b = L"[";
+            for (int i = 0; i < 10; ++i) b += (i < filled) ? L"#" : L".";
+            b += L"]";
+            return b;
+        };
+        // Freshest successful fetch time among sources, for a staleness hint.
+        double latest = std::max(c.lastSuccessTime, ag.lastSuccessTime);
+        std::wstring updated;
+        if (latest > 0) {
+            time_t ut = static_cast<time_t>(latest);
+            struct tm tmBuf{};
+            localtime_s(&tmBuf, &ut);
+            wchar_t timeBuf[32];
+            swprintf_s(timeBuf, L"\u66F4\u65B0\u4E8E %02d:%02d:%02d", // 更新于
+                       tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec);
+            updated = timeBuf;
+        }
+
+        std::wstring t = L"===== AI Usage =====\n";
+        t += L" \u914D\u989D"; // 配额
+        if (!updated.empty()) t += L"  [" + updated + L"]";
+        t += L"\n";
 
         auto addReset = [&](const std::string& iso) -> std::wstring {
             SYSTEMTIME loc{};
             if (!IsoToLocalSystemTime(iso, &loc)) return L"--";
             wchar_t b[48];
-            swprintf_s(b, L"%04d-%02d-%02d %02d:%02d",
-                loc.wYear, loc.wMonth, loc.wDay, loc.wHour, loc.wMinute);
+            swprintf_s(b, L"%02d-%02d %02d:%02d",
+                loc.wMonth, loc.wDay, loc.wHour, loc.wMinute);
             return b;
         };
         auto addQuotaLine = [&](const wchar_t* provider,
                                 const wchar_t* window,
                                 int remaining,
                                 const std::wstring& reset) {
+            t += L" ";
             t += provider;
-            t += L" \u00B7 ";
+            t += L" ";
             t += window;
             t += L"  ";
             if (remaining >= 0) {
+                t += bar(remaining);
+                t += L" ";
                 t += std::to_wstring(std::clamp(remaining, 0, 100));
-                t += L"% \u5269\u4F59";
+                t += L"%";
             } else {
-                t += L"--";
+                t += L"[..........] --";
             }
             if (!reset.empty() && reset != L"--") {
-                t += L"  \u00B7  ";
+                t += L"  ";
                 t += reset;
-                t += L" \u91CD\u7F6E";
             }
             t += L"\n";
         };
@@ -1793,7 +1918,7 @@ private:
                     ? 100 - c.sevenDayPercent : -1,
                 addReset(c.sevenDayResetAt));
         } else {
-            t += L"Claude  --\n";
+            t += L" Claude [!] \u672A\u83B7\u53D6\n"; // 未获取
         }
         if (x.success) {
             addQuotaLine(
@@ -1809,35 +1934,65 @@ private:
                         x.weekly.resetAtUnixSeconds)
                     : L"");
         } else {
-            t += L"Codex  --\n";
+            t += L" Codex [!] \u672A\u83B7\u53D6\n"; // 未获取
         }
 
         if (ag.success && !ag.models.empty()) {
+            // Dedup rule (user preference): keep every non-Gemini model
+            // (Claude/GPT/others), and for Gemini keep only the LATEST
+            // version of each variant ("Gemini 3.6 Flash High" wins over
+            // "Gemini 3.1 Flash High"). The old wall of 13 identical rows is
+            // gone and the sections below it (reset radar / account /
+            // status) are no longer pushed out of the tip buffer.
+            std::map<std::string, int> bestGeminiVersion; // family -> max
             for (const auto& model : ag.models) {
+                const int v = GeminiModelVersion(model.displayName);
+                if (v < 0) continue;
+                const std::string family = GeminiModelFamily(model.displayName);
+                auto& best = bestGeminiVersion[family];
+                if (v > best) best = v;
+            }
+            std::set<std::string> shownFamilies; // one row per Gemini family
+            for (const auto& model : ag.models) {
+                const int v = GeminiModelVersion(model.displayName);
+                if (v >= 0) {
+                    const std::string family =
+                        GeminiModelFamily(model.displayName);
+                    if (v != bestGeminiVersion[family]) continue; // old version
+                    // Same family, same version (High/Low tiers): keep one.
+                    if (!shownFamilies.insert(family).second) continue;
+                }
+                // No progress bar here: model names are long and the rows
+                // must stay compact so every tooltip section stays visible.
+                t += L" ";
                 t += ToWide(model.displayName);
-                t += L"  ";
+                t += L" ";
                 t += std::to_wstring(std::clamp(model.percent(), 0, 100));
-                t += L"% \u5269\u4F59";
+                t += L"%";
                 if (!model.resetTime.empty()) {
-                    t += L"  \u00B7  ";
-                    t += IsoToLocalDateTimeW(model.resetTime);
-                    t += L" \u91CD\u7F6E";
+                    const std::wstring reset = IsoToLocalDateTimeW(model.resetTime);
+                    if (reset.size() >= 5) {
+                        t += L" ";
+                        t += reset.substr(0, 5); // MM-DD
+                    }
                 }
                 t += L"\n";
             }
-            if (!ag.tier.empty()) {
-                t += L"\u5957\u9910  " + ToWide(ag.tier) + L"\n";
+            const std::wstring agTierLabel = FormatAgTier(ag.tier);
+            if (!agTierLabel.empty()) {
+                t += L"  \u5957\u9910  " + agTierLabel + L"\n"; // 套餐
             }
         } else {
-            t += L"Antigravity  --\n";
+            // 未授权 → 双击 ag-login.exe
+            t += L" \u53CD\u91CD\u529B [!] \u672A\u6388\u6743 \u2192 \u53CC\u51FB ag-login.exe\n";
         }
 
         if (kiro.success) {
-            t += L"Kiro Credits  ";
+            t += L" Kiro Credits  ";
             t += std::to_wstring(kiro.remaining);
             t += L" / ";
             t += std::to_wstring(kiro.limit);
-            t += L" \u5269\u4F59";
+            t += L" \u5269\u4F59"; // 剩余
             if (kiro.percent >= 0) {
                 t += L"  \u00B7  ";
                 t += std::to_wstring(std::clamp(kiro.percent, 0, 100));
@@ -1845,7 +2000,7 @@ private:
             }
             t += L"\n";
         } else {
-            t += L"Kiro Credits  --\n";
+            t += L" Kiro Credits [!] \u672A\u767B\u5F55\n"; // 未登录
         }
 
         if (dash_.GetOptions().showResetRadar) {
@@ -1975,35 +2130,54 @@ private:
             t += buffer;
         }
         if (!c.subscriptionStatus.empty()) {
-            t += L"Claude  " + ToWide(c.subscriptionStatus) + L"\n";
+            // Only render known lifecycle statuses. Unknown tier identifiers
+            // (e.g. "g1-pro-tier") are not meaningful on the dashboard and
+            // are hidden by default (user preference).
+            const std::string st = c.subscriptionStatus;
+            if (st == "active" || st == "trialing" || st == "canceled"
+                || st == "past_due" || st == "paused") {
+                t += L"Claude  " + ToWide(st) + L"\n";
+            }
         }
 
-        t += L"\n\u72B6\u6001\n";
+        t += L"\n\u72B6\u6001\n"; // 状态
         if (!proxyConfig_.statusMessage.empty()) {
-            t += L"\u7F51\u7EDC  ";
-            t += proxyConfig_.statusMessage;
+            t += L" [ok] \u7F51\u7EDC  "; // 网络
+            std::wstring net = proxyConfig_.statusMessage;
+            if (net.size() > 42) { // keep the row short for the tip budget
+                net.resize(42);
+                net += L"...";
+            }
+            t += net;
             t += L"\n";
         } else if (proxyConfig_.systemProxyDetected) {
-            t += L"\u7F51\u7EDC  System proxy\n";
+            t += L" [ok] \u7F51\u7EDC  System proxy\n"; // 网络
         } else {
-            t += L"\u7F51\u7EDC  Direct / auto\n";
+            t += L" [ok] \u7F51\u7EDC  Direct / auto\n"; // 网络
         }
         if (!c.errorMessage.empty()) {
-            t += L"Claude  " + c.errorMessage + L"\n";
+            t += L" [!] Claude  " + c.errorMessage + L"\n";
         }
         if (!x.errorMessage.empty()) {
-            t += L"Codex  " + x.errorMessage + L"\n";
+            t += L" [!] Codex  " + x.errorMessage + L"\n";
         }
         if (!ag.errorMessage.empty()) {
-            t += L"Antigravity  " + ag.errorMessage + L"\n";
+            t += L" [!] Antigravity  " + ag.errorMessage + L"\n";
         }
         if (!kiro.errorMessage.empty()) {
-            t += L"Kiro  " + kiro.errorMessage + L"\n";
+            t += L" [!] Kiro  " + kiro.errorMessage + L"\n";
         }
         if (!x.resetRadar.errorMessage.empty()) {
-            t += L"\u91CD\u7F6E\u6E90  ";
+            t += L" [!] \u91CD\u7F6E\u6E90  "; // 重置源
             t += x.resetRadar.errorMessage;
             t += L"\n";
+        }
+        // Guard against host-side fixed-size tooltip buffers: keep the text
+        // bounded (quota rows come first, truncation drops the tail).
+        constexpr size_t kMaxTipChars = 768;
+        if (t.size() > kMaxTipChars) {
+            t.resize(kMaxTipChars - 3);
+            t += L"...";
         }
         return t;
     }
@@ -2017,8 +2191,16 @@ private:
     std::wstring configDir_;
     mutable std::mutex mu_;
     std::wstring tip_ = L"AI Usage: waiting for data";
+    // Fixed-address tooltip buffer handed to the host. Never reallocated, so
+    // the returned pointer stays valid even if the host keeps it across calls
+    // (the dangling-pointer bug: tooltipOut_ was a wstring that moved).
+    static constexpr size_t kTooltipBufSize = 2048;
+    wchar_t tooltipBuf_[kTooltipBufSize] = {};
     bool busy_ = false;
     bool configReloadPending_ = false;
+    std::atomic<bool> stop_{false};
+    std::thread worker_;
+    std::atomic<bool> workerExited_{false};
     std::chrono::steady_clock::time_point lastFetch_{};
     static constexpr std::chrono::minutes interval_{1};
 };
@@ -2026,8 +2208,21 @@ private:
 } // namespace
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) InitGdiplus();
-    if (reason == DLL_PROCESS_DETACH) ShutdownGdiplus();
+    if (reason == DLL_PROCESS_ATTACH) {
+        InitGdiplus();
+    } else if (reason == DLL_PROCESS_DETACH) {
+        // Clean shutdown: signal the background fetch worker to stop and wait
+        // for it. Without this, a detached worker thread could keep the host
+        // process alive after exit (the residual-process bug). The fetchers'
+        // WinHttp timeouts bound a single in-flight request, so join() returns
+        // promptly rather than hanging on a stalled network call.
+        AIUsagePlugin::Instance().Shutdown();
+        // NOTE: GdiplusShutdown() is intentionally NOT called here. Calling it
+        // under the loader lock (DLL_PROCESS_DETACH) is forbidden by Microsoft
+        // and can deadlock/crash on unload. The process is exiting anyway, so
+        // the OS reclaims the GDI+ token; the dashboard only ever re-inits it
+        // on DLL_PROCESS_ATTACH of a fresh load.
+    }
     return TRUE;
 }
 

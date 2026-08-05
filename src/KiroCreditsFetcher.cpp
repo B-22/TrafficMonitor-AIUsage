@@ -117,7 +117,7 @@ std::optional<std::string> KiroCreditsFetcher::HttpPost(
         if (!request) { if (errorMessage) *errorMessage = L"WinHttpOpenRequest failed"; break; }
         for (const auto& h : headers)
             WinHttpAddRequestHeaders(request, h.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
-        WinHttpSetTimeouts(request, 10000, 10000, 10000, 30000);
+        WinHttpSetTimeouts(request, 5000, 5000, 5000, 5000);
         // The request body is already UTF-8 bytes. WinHttpSendRequest takes a
         // raw byte buffer, so it must NOT be widened to UTF-16.
         LPVOID bodyPtr = body.empty()
@@ -135,10 +135,13 @@ std::optional<std::string> KiroCreditsFetcher::HttpPost(
         WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
         std::string respBody;
+        constexpr size_t kMaxBodyBytes = 4 * 1024 * 1024; // cap oversized response
         for (;;) {
             DWORD available = 0;
             if (!WinHttpQueryDataAvailable(request, &available)) break;
             if (available == 0) { result = std::move(respBody); break; }
+            if (respBody.size() >= kMaxBodyBytes) break;
+            if (available > kMaxBodyBytes - respBody.size()) available = kMaxBodyBytes - respBody.size();
             std::string chunk(available, '\0');
             DWORD downloaded = 0;
             if (!WinHttpReadData(request, chunk.data(), available, &downloaded)) break;
@@ -173,7 +176,7 @@ std::optional<std::string> KiroCreditsFetcher::HttpGet(
         if (!request) { if (errorMessage) *errorMessage = L"WinHttpOpenRequest failed"; break; }
         for (const auto& h : headers)
             WinHttpAddRequestHeaders(request, h.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
-        WinHttpSetTimeouts(request, 10000, 10000, 10000, 30000);
+        WinHttpSetTimeouts(request, 5000, 5000, 5000, 5000);
         if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
             if (errorMessage) *errorMessage = L"WinHttpSendRequest failed"; break;
         }
@@ -184,10 +187,13 @@ std::optional<std::string> KiroCreditsFetcher::HttpGet(
         WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
         std::string respBody;
+        constexpr size_t kMaxBodyBytes = 4 * 1024 * 1024; // cap oversized response
         for (;;) {
             DWORD available = 0;
             if (!WinHttpQueryDataAvailable(request, &available)) break;
             if (available == 0) { result = std::move(respBody); break; }
+            if (respBody.size() >= kMaxBodyBytes) break;
+            if (available > kMaxBodyBytes - respBody.size()) available = kMaxBodyBytes - respBody.size();
             std::string chunk(available, '\0');
             DWORD downloaded = 0;
             if (!WinHttpReadData(request, chunk.data(), available, &downloaded)) break;

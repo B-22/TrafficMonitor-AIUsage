@@ -37,6 +37,26 @@ std::string WideToUtf8(const std::wstring& s) {
     return out;
 }
 
+// Percent-encode a URL query value (RFC 3986 unreserved set kept literal).
+// Required for the OAuth refresh form body: refresh_token/client_secret may
+// contain characters (+, /, =, &) that would corrupt x-www-form-urlencoded.
+std::string UrlEncode(const std::string& in) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0xF];
+        }
+    }
+    return out;
+}
+
 // "gemini-3-5-pro" -> "Gemini 3.5 Pro"  (mirrors reference display logic)
 std::string FormatModelDisplayName(const std::string& raw) {
     std::string name = std::regex_replace(raw, std::regex(R"((\d+)-(\d+))"), "$1.$2");
@@ -115,7 +135,7 @@ std::optional<std::string> AntigravityUsageFetcher::HttpPost(
         for (const auto& h : headers) {
             WinHttpAddRequestHeaders(request, h.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
         }
-        WinHttpSetTimeouts(request, 10000, 10000, 10000, 15000);
+        WinHttpSetTimeouts(request, 5000, 5000, 5000, 5000);
 
         // The request body is already UTF-8 bytes. WinHttpSendRequest takes a
         // raw byte buffer, so it must NOT be widened to UTF-16.
@@ -136,10 +156,13 @@ std::optional<std::string> AntigravityUsageFetcher::HttpPost(
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
 
         std::string respBody;
+        constexpr size_t kMaxBodyBytes = 4 * 1024 * 1024; // cap oversized response
         for (;;) {
             DWORD available = 0;
             if (!WinHttpQueryDataAvailable(request, &available)) break;
             if (available == 0) { result = std::move(respBody); break; }
+            if (respBody.size() >= kMaxBodyBytes) break;
+            if (available > kMaxBodyBytes - respBody.size()) available = kMaxBodyBytes - respBody.size();
             std::string chunk(available, '\0');
             DWORD downloaded = 0;
             if (!WinHttpReadData(request, chunk.data(), available, &downloaded)) break;
@@ -160,9 +183,9 @@ bool AntigravityUsageFetcher::RefreshAccessToken(std::wstring* errorMessage) {
         return false;
     }
     std::string body = "grant_type=refresh_token"
-        "&refresh_token=" + refreshToken_
-        + "&client_id=" + clientId_
-        + "&client_secret=" + clientSecret_;
+        "&refresh_token=" + UrlEncode(refreshToken_)
+        + "&client_id=" + UrlEncode(clientId_)
+        + "&client_secret=" + UrlEncode(clientSecret_);
 
     std::vector<std::wstring> headers = {
         L"Content-Type: application/x-www-form-urlencoded",
@@ -190,8 +213,27 @@ bool AntigravityUsageFetcher::RefreshAccessToken(std::wstring* errorMessage) {
 }
 
 bool AntigravityUsageFetcher::EnsureAccessToken(std::wstring* errorMessage) {
-    if (clientId_.empty() || clientSecret_.empty()) {
-        if (errorMessage) *errorMessage = L"Antigravity ClientId/ClientSecret not set in AIUsage.ini";
+    if (clientId_.empty()) {
+        if (errorMessage) *errorMessage = L"Antigravity ClientId not set in AIUsage.ini";
+        return false;
+    }
+    if (clientSecret_.empty()) {
+        // No built-in secret: allow AIUSAGE_AG_CLIENT_SECRET env override.
+        wchar_t envBuf[512];
+        const DWORD envLen = GetEnvironmentVariableW(
+            L"AIUSAGE_AG_CLIENT_SECRET", envBuf, 512);
+        if (envLen > 0 && envLen < 512) {
+            char narrow[512]{};
+            WideCharToMultiByte(CP_UTF8, 0, envBuf, -1,
+                narrow, 512, nullptr, nullptr);
+            clientSecret_ = narrow;
+        }
+    }
+    if (clientSecret_.empty()) {
+        if (errorMessage) {
+            *errorMessage = L"Antigravity 未配置 ClientSecret：请在 AIUsage.ini"
+                            L"[Antigravity] 段填写，或设置环境变量 AIUSAGE_AG_CLIENT_SECRET";
+        }
         return false;
     }
     double now = static_cast<double>(time(nullptr));
@@ -199,7 +241,10 @@ bool AntigravityUsageFetcher::EnsureAccessToken(std::wstring* errorMessage) {
     if (!refreshToken_.empty()) return RefreshAccessToken(errorMessage);
     // No refresh token: trust the provided access token (refreshed on 401).
     if (!accessToken_.empty()) return true;
-    if (errorMessage) *errorMessage = L"No Antigravity credentials configured";
+    if (errorMessage) {
+        *errorMessage = L"Antigravity 未授权：请运行 ag-login.exe 完成一次性 Google 登录"
+                        L"（自动写回 AIUsage.ini [Antigravity]）";
+    }
     return false;
 }
 

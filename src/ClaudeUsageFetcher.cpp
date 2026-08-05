@@ -116,7 +116,7 @@ std::optional<std::string> ClaudeUsageFetcher::HttpGet(
             WinHttpAddRequestHeaders(request, h.c_str(), static_cast<DWORD>(-1L), WINHTTP_ADDREQ_FLAG_ADD);
         }
 
-        WinHttpSetTimeouts(request, 10000, 10000, 10000, 15000);
+        WinHttpSetTimeouts(request, 5000, 5000, 5000, 5000);
 
         if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
             if (errorMessage) *errorMessage = L"WinHttpSendRequest failed"; break;
@@ -130,10 +130,13 @@ std::optional<std::string> ClaudeUsageFetcher::HttpGet(
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
 
         std::string body;
+        constexpr size_t kMaxBodyBytes = 4 * 1024 * 1024; // cap: hostile/huge response
         for (;;) {
             DWORD available = 0;
             if (!WinHttpQueryDataAvailable(request, &available)) break;
             if (available == 0) { result = std::move(body); break; }
+            if (body.size() >= kMaxBodyBytes) break; // drop oversized body
+            if (available > kMaxBodyBytes - body.size()) available = kMaxBodyBytes - body.size();
             std::string chunk(available, '\0');
             DWORD downloaded = 0;
             if (!WinHttpReadData(request, chunk.data(), available, &downloaded)) break;
@@ -219,7 +222,7 @@ std::optional<std::string> ClaudeUsageFetcher::RefreshCliToken(const std::string
         std::wstring wua = Utf8ToWide(std::string(FALLBACK_UA));
         std::wstring headers = L"Content-Type: application/json\r\nUser-Agent: " + wua;
         WinHttpAddRequestHeaders(request, headers.c_str(), static_cast<DWORD>(-1L), WINHTTP_ADDREQ_FLAG_ADD);
-        WinHttpSetTimeouts(request, 10000, 10000, 10000, 15000);
+        WinHttpSetTimeouts(request, 5000, 5000, 5000, 5000);
 
         std::wstring wbody(body.begin(), body.end());
         BOOL sent = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -233,9 +236,12 @@ std::optional<std::string> ClaudeUsageFetcher::RefreshCliToken(const std::string
 
             if (statusCode == 200) {
                 std::string respBody;
+                constexpr size_t kMaxBodyBytes = 4 * 1024 * 1024; // cap oversized response
                 for (;;) {
                     DWORD available = 0;
                     if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+                    if (respBody.size() >= kMaxBodyBytes) break;
+                    if (available > kMaxBodyBytes - respBody.size()) available = kMaxBodyBytes - respBody.size();
                     std::string chunk(available, '\0');
                     DWORD downloaded = 0;
                     if (!WinHttpReadData(request, chunk.data(), available, &downloaded)) break;

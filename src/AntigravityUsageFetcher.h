@@ -44,14 +44,19 @@ public:
     void SetEnabled(bool enabled) { enabled_ = enabled; }
     bool IsEnabled() const { return enabled_; }
 
-    // Credentials from AIUsage.ini [Antigravity].
+    // Credentials from AIUsage.ini [Antigravity]. Empty ClientId falls back to
+    // the built-in Cloud Code installed-app client id. The client secret is
+    // NOT embedded in the binary: it is taken from the ini value, or from the
+    // AIUSAGE_AG_CLIENT_SECRET environment variable as a fallback (kept out
+    // of git to avoid GitHub secret-scan push blocks; Google treats
+    // installed-app secrets as non-confidential).
     void SetCredentials(const std::string& accessToken,
                         const std::string& refreshToken,
                         const std::string& clientId,
                         const std::string& clientSecret) {
         accessToken_ = accessToken;
         refreshToken_ = refreshToken;
-        clientId_ = clientId;
+        clientId_ = clientId.empty() ? kDefaultClientId : clientId;
         clientSecret_ = clientSecret;
     }
 
@@ -64,12 +69,11 @@ private:
     static constexpr const char* kFetchModelsPath = "/v1internal:fetchAvailableModels";
     static constexpr const char* kTokenHost = "oauth2.googleapis.com";
     static constexpr const char* kTokenPath = "/token";
-    // Public Cloud Code OAuth client id (installed-app, not secret). The
-    // client secret is supplied via AIUsage.ini [Antigravity] ClientSecret;
-    // it defaults empty and must be filled in by the user. The reference
-    // AntigravityQuotaWatcher / Float apps ship this secret in clear text
-    // because Google treats installed-app secrets as non-confidential, but
-    // we avoid hardcoding it so it never lands in git history.
+    // Public Cloud Code OAuth client id (installed-app). Google treats the
+    // installed-app client_secret as non-confidential and desktop clients ship
+    // it in plain text; we still keep it out of the binary/git to avoid
+    // GitHub secret-scan push blocks — supply it via AIUsage.ini ClientSecret
+    // or the AIUSAGE_AG_CLIENT_SECRET environment variable.
     static constexpr const char* kDefaultClientId =
         "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 

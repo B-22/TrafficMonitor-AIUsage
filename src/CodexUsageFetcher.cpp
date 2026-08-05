@@ -39,7 +39,7 @@ std::optional<std::string> HttpGetJson(const ProxyConfig& proxyConfig,
                                        const std::wstring& path,
                                        const std::vector<std::wstring>& headers,
                                        std::wstring* errorMessage,
-                                       DWORD timeoutMilliseconds = 15000) {
+                                       DWORD timeoutMilliseconds = 5000) {
     if (errorMessage != nullptr) {
         errorMessage->clear();
     }
@@ -369,7 +369,7 @@ ResetRadarSnapshot CodexUsageFetcher::FetchResetRadar() const {
             L"/api/status.json",
             {L"Accept: application/json"},
             &runwayError,
-            8000);
+            5000);
         if (runwayJson.has_value()) {
             runway = ParseCodexRunwayResetStatusJson(
                 *runwayJson, nowUnix, &runwayError);
@@ -418,7 +418,7 @@ ResetRadarSnapshot CodexUsageFetcher::FetchResetRadar() const {
             L"/current.json",
             {},
             &error,
-            8000);
+            5000);
         if (summaryJson.has_value()) {
             summary = ParseResetRadarSummaryJson(*summaryJson, &error);
             if (!summary.success) summary.errorMessage = error;
@@ -434,7 +434,7 @@ ResetRadarSnapshot CodexUsageFetcher::FetchResetRadar() const {
             L"/api/forecast",
             {},
             &error,
-            8000);
+            5000);
         if (forecastJson.has_value()) {
             forecast = ParseResetForecastJson(*forecastJson, &error);
             if (!forecast.success) forecast.errorMessage = error;

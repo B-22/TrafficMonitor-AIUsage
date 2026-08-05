@@ -12,3 +12,8 @@ _recycle_bin/
 docs/reference/quota_card.py
 docs/reference/*.dc.html
 docs/reference/*.py
+
+# Local deploy runtime artifacts and build outputs (CI builds these)
+deploy-local.log
+server/aiusage-server.exe
+tools/ag-login/ag-login.exe
